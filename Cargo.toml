@@ -1,0 +1,21 @@
+[package]
+name = "hisi-crypto-ws63"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["sanchuanhehe"]
+license = "MIT"
+description = "Fallible WS63 cipher/TRNG backend for hisi-crypto"
+repository = "https://github.com/hispark-rs/hisi-crypto-ws63"
+keywords = ["embedded", "no-std", "cryptography", "hisilicon", "ws63"]
+categories = ["cryptography", "embedded", "no-std"]
+
+[dependencies]
+hisi-crypto = "0.1.0-alpha.3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
