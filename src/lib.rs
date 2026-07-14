@@ -1,10 +1,17 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
-use hisi_crypto::{CryptoError, EntropySource, Pbkdf2HmacSha1};
+#[cfg(any(feature = "pbkdf2", feature = "trng"))]
+use hisi_crypto::CryptoError;
+#[cfg(feature = "trng")]
+use hisi_crypto::EntropySource;
+#[cfg(feature = "pbkdf2")]
+use hisi_crypto::Pbkdf2HmacSha1;
 
+#[cfg(feature = "pbkdf2")]
 const HMAC_SHA1: u32 = 0x10f6_90a0;
 
+#[cfg(feature = "pbkdf2")]
 #[repr(C)]
 struct Pbkdf2Parameters {
     hash_type: u32,
@@ -37,6 +44,7 @@ impl Ws63Crypto {
     }
 }
 
+#[cfg(feature = "pbkdf2")]
 impl Pbkdf2HmacSha1 for Ws63Crypto {
     fn derive_32(
         &self,
@@ -80,6 +88,7 @@ impl Pbkdf2HmacSha1 for Ws63Crypto {
     }
 }
 
+#[cfg(feature = "trng")]
 impl EntropySource for Ws63Crypto {
     fn fill_entropy(&self, output: &mut [u8]) -> Result<(), CryptoError> {
         if output.is_empty() {
@@ -108,26 +117,30 @@ impl EntropySource for Ws63Crypto {
 
 #[cfg(target_arch = "riscv32")]
 unsafe extern "C" {
+    #[cfg(feature = "pbkdf2")]
     fn uapi_drv_cipher_pbkdf2(
         parameters: *const Pbkdf2Parameters,
         output: *mut u8,
         output_len: u32,
     ) -> u32;
+    #[cfg(feature = "trng")]
     fn uapi_drv_cipher_trng_get_random_bytes(output: *mut u8, length: u32) -> u32;
 }
 
-#[cfg(target_arch = "riscv32")]
+#[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
 const _: () = assert!(core::mem::size_of::<Pbkdf2Parameters>() == 24);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(any(feature = "pbkdf2", feature = "trng"))]
     fn backend() -> Ws63Crypto {
         // SAFETY: each host test owns its local non-functional backend value.
         unsafe { Ws63Crypto::assume_exclusive() }
     }
 
+    #[cfg(feature = "pbkdf2")]
     #[test]
     fn rejects_zero_and_oversized_iterations_before_uapi() {
         let mut output = [0; 32];
@@ -141,6 +154,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "trng")]
     #[test]
     fn empty_entropy_request_is_a_noop() {
         assert_eq!(backend().fill_entropy(&mut []), Ok(()));

@@ -13,9 +13,13 @@ categories = ["cryptography", "embedded", "no-std"]
 [dependencies]
 hisi-crypto = "0.1.0-alpha.3"
 
+[features]
+default = ["pbkdf2", "trng"]
+pbkdf2 = []
+trng = []
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
-
