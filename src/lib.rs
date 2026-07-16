@@ -3,10 +3,9 @@
 
 use core::{cell::Cell, num::NonZeroU32};
 
-#[cfg(all(feature = "hash", target_arch = "riscv32"))]
+#[cfg(all(any(feature = "cipher", feature = "hash"), target_arch = "riscv32"))]
 use core::cell::UnsafeCell;
 
-#[cfg(any(feature = "pbkdf2", feature = "hal-trng"))]
 use hisi_crypto::CryptoError;
 #[cfg(feature = "hal-trng")]
 use hisi_crypto::EntropySource;
@@ -16,10 +15,10 @@ use hisi_hal::{
     peripherals::{Km, Spacc, Trng},
     trng::TrngDriver,
 };
-#[cfg(target_arch = "riscv32")]
+#[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
 use zeroize::Zeroize;
 
-#[cfg(target_arch = "riscv32")]
+#[cfg(all(target_arch = "riscv32", any(feature = "cipher", feature = "pbkdf2")))]
 use ws63_pac::km::RegisterBlock;
 
 #[cfg(feature = "hash")]
@@ -28,6 +27,12 @@ mod spacc_hash;
 use spacc_hash::HashDmaStorage;
 #[cfg(feature = "hash")]
 pub use spacc_hash::{MAX_HASH_INPUT_BYTES, SpaccPollLimits};
+#[cfg(feature = "cipher")]
+mod spacc_cipher;
+#[cfg(all(feature = "cipher", target_arch = "riscv32"))]
+use spacc_cipher::CipherDmaStorage;
+#[cfg(feature = "cipher")]
+pub use spacc_cipher::SpaccCipherPollLimits;
 
 const DEFAULT_POLL_LIMIT: u32 = 1_000_000;
 #[cfg(all(feature = "pbkdf2", any(target_arch = "riscv32", test)))]
@@ -91,14 +96,32 @@ impl Default for RkpPollLimits {
 pub struct Ws63Crypto<'d> {
     _km: Km<'d>,
     _spacc: Spacc<'d>,
+    #[cfg_attr(not(any(feature = "hal-trng", feature = "pbkdf2")), allow(dead_code))]
     trng: TrngDriver<'d>,
-    #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
+    #[cfg_attr(
+        any(not(target_arch = "riscv32"), not(feature = "pbkdf2")),
+        allow(dead_code)
+    )]
     limits: RkpPollLimits,
     #[cfg(feature = "hash")]
     #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
     spacc_limits: SpaccPollLimits,
     #[cfg(all(feature = "hash", target_arch = "riscv32"))]
     hash_storage: UnsafeCell<HashDmaStorage>,
+    #[cfg(feature = "cipher")]
+    #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
+    cipher_limits: SpaccCipherPollLimits,
+    #[cfg(all(feature = "cipher", target_arch = "riscv32"))]
+    cipher_storage: UnsafeCell<CipherDmaStorage>,
+    #[cfg_attr(
+        not(any(
+            feature = "cipher",
+            feature = "hal-trng",
+            feature = "hash",
+            feature = "pbkdf2"
+        )),
+        allow(dead_code)
+    )]
     busy: Cell<bool>,
 }
 
@@ -112,6 +135,8 @@ impl<'d> Ws63Crypto<'d> {
             RkpPollLimits::default(),
             #[cfg(feature = "hash")]
             SpaccPollLimits::default(),
+            #[cfg(feature = "cipher")]
+            SpaccCipherPollLimits::default(),
         )
     }
 
@@ -122,6 +147,7 @@ impl<'d> Ws63Crypto<'d> {
         trng: Trng<'d>,
         limits: RkpPollLimits,
         #[cfg(feature = "hash")] spacc_limits: SpaccPollLimits,
+        #[cfg(feature = "cipher")] cipher_limits: SpaccCipherPollLimits,
     ) -> Self {
         Self {
             _km: km,
@@ -132,10 +158,23 @@ impl<'d> Ws63Crypto<'d> {
             spacc_limits,
             #[cfg(all(feature = "hash", target_arch = "riscv32"))]
             hash_storage: UnsafeCell::new(HashDmaStorage::new()),
+            #[cfg(feature = "cipher")]
+            cipher_limits,
+            #[cfg(all(feature = "cipher", target_arch = "riscv32"))]
+            cipher_storage: UnsafeCell::new(CipherDmaStorage::new()),
             busy: Cell::new(false),
         }
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "cipher",
+            feature = "hal-trng",
+            feature = "hash",
+            feature = "pbkdf2"
+        )),
+        allow(dead_code)
+    )]
     fn enter(&self) -> Result<BusyGuard<'_>, CryptoError> {
         if self.busy.replace(true) {
             Err(CryptoError::Backend(ERR_BUSY))
@@ -144,7 +183,7 @@ impl<'d> Ws63Crypto<'d> {
         }
     }
 
-    #[cfg(target_arch = "riscv32")]
+    #[cfg(all(target_arch = "riscv32", any(feature = "cipher", feature = "pbkdf2")))]
     fn regs(&self) -> &'static RegisterBlock {
         // SAFETY: `self._km` owns the unique HAL token for this static MMIO block.
         unsafe { &*Km::ptr() }
@@ -251,8 +290,10 @@ impl<'d> Ws63Crypto<'d> {
                 .write(|w| unsafe { w.data().bits(word_at(salt, index)) });
             io_fence();
         }
-        for (index, chunk) in SHA1_INITIAL_STATE.chunks_exact(4).enumerate() {
-            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        let (state_words, remainder) = SHA1_INITIAL_STATE.as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for (index, chunk) in state_words.iter().enumerate() {
+            let word = u32::from_le_bytes(*chunk);
             // SAFETY: `data` is the complete SVD-modeled 32-bit state word.
             regs.rkp_pbkdf2_val(index)
                 .write(|w| unsafe { w.data().bits(word) });
@@ -327,6 +368,15 @@ impl<'d> Ws63Crypto<'d> {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "cipher",
+        feature = "hal-trng",
+        feature = "hash",
+        feature = "pbkdf2"
+    )),
+    allow(dead_code)
+)]
 struct BusyGuard<'a> {
     busy: &'a Cell<bool>,
 }
@@ -393,7 +443,7 @@ fn word_at(bytes: &[u8; PASSWORD_BLOCK_BYTES], index: usize) -> u32 {
     u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
 }
 
-#[cfg(target_arch = "riscv32")]
+#[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
 #[inline]
 fn io_fence() {
     // SAFETY: this emits only an ordering barrier for prior/following MMIO.

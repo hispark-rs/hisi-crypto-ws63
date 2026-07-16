@@ -6,6 +6,9 @@
 
 - PAC-driven SPACC SHA-1/SHA-256 and HMAC-SHA1/HMAC-SHA256 with bounded polling,
   cache maintenance, explicit errors, and no implicit fallback.
+- PAC-driven SPACC AES-128/192/256 block encryption/decryption using a locked
+  KM/KLAD MCipher keyslot, bounded waits, cache maintenance, and fail-closed
+  cleanup. NIST vectors and repeated WPA2 silicon HIL cover the path.
 
 ### Changed
 

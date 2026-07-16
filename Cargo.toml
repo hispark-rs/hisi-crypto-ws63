@@ -13,16 +13,17 @@ categories = ["cryptography", "embedded", "no-std"]
 [dependencies]
 critical-section = "1"
 hisi-crypto = "0.1.0-alpha.3"
-hisi-hal = { version = "0.7.0-alpha.2", default-features = false, features = ["chip-ws63"] }
+hisi-hal = { version = "0.7.0-alpha.2", default-features = false, features = ["chip-ws63", "unstable"] }
 ws63-pac = { version = "0.3.0", default-features = false }
 zeroize = { version = "1", default-features = false }
 
 [features]
-default = ["hash", "pbkdf2", "hal-trng"]
+default = ["cipher", "hash", "pbkdf2", "hal-trng"]
+cipher = []
 hash = []
 pbkdf2 = []
 hal-trng = []
-diagnostics = ["hash"]
+diagnostics = ["cipher", "hash"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

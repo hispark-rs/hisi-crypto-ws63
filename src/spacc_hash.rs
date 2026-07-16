@@ -452,11 +452,13 @@ impl Ws63Crypto<'_> {
         regs.in_hash_chn1_node_length(HASH_CHANNEL_INDEX)
             .write(|w| unsafe { w.node_length().bits(HASH_RING_DEPTH) });
 
-        for (index, chunk) in algorithm.initial_state().chunks_exact(4).enumerate() {
+        let (state_words, remainder) = algorithm.initial_state().as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for (index, chunk) in state_words.iter().enumerate() {
             // SAFETY: SHA-1 uses 5 words and SHA-256 uses 8, both within 5 bits.
             regs.chann1_hash_state_val_addr(HASH_CHANNEL_INDEX)
                 .write(|w| unsafe { w.index().bits(index as u8) });
-            let state = u32::from_le_bytes(chunk.try_into().unwrap());
+            let state = u32::from_le_bytes(*chunk);
             // SAFETY: write the complete SVD-modeled state data word.
             regs.chann1_hash_state_val(HASH_CHANNEL_INDEX)
                 .write(|w| unsafe { w.state().bits(state) });
@@ -511,7 +513,9 @@ impl Ws63Crypto<'_> {
 
     #[cfg(target_arch = "riscv32")]
     fn read_hash_state(&self, regs: &RegisterBlock, output: &mut [u8]) {
-        for (index, chunk) in output.chunks_exact_mut(4).enumerate() {
+        let (output_words, remainder) = output.as_chunks_mut::<4>();
+        debug_assert!(remainder.is_empty());
+        for (index, chunk) in output_words.iter_mut().enumerate() {
             // SAFETY: SHA-1 uses 5 words and SHA-256 uses 8, both within 5 bits.
             regs.chann1_hash_state_val_addr(HASH_CHANNEL_INDEX)
                 .write(|w| unsafe { w.index().bits(index as u8) });
