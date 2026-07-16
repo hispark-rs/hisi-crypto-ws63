@@ -16,8 +16,9 @@ use hisi_crypto::sae::{GROUP_19, Group19, RustCryptoGroup19};
 use hisi_crypto::{
     CryptoError, EntropySource,
     sae::{
-        P256_ELEMENT_BYTES, P256AffinePoint, P256FieldElement, P256PointResult, TryP256FieldMul,
-        TryP256FieldPow, TryP256PointAdd, TryP256PointMul,
+        P256_ELEMENT_BYTES, P256AffinePoint, P256FieldElement, P256PointResult,
+        TryP256ComputeYSquared, TryP256FieldMul, TryP256FieldPow, TryP256PointAdd,
+        TryP256PointInvert, TryP256PointMul, TryP256PointValidate,
     },
 };
 use hisi_hal::peripherals::Pke;
@@ -474,6 +475,66 @@ impl<'d> Ws63P256<'d> {
     }
 
     #[cfg(target_arch = "riscv32")]
+    fn compute_y_squared_hardware<R: EntropySource>(
+        &self,
+        entropy: &R,
+        x: &P256FieldElement,
+        output: &mut P256FieldElement,
+    ) -> Result<(), CryptoError> {
+        let coefficient_a = P256FieldElement::try_from_be_bytes(P256_A)?;
+        let coefficient_b = P256FieldElement::try_from_be_bytes(P256_B)?;
+        let mut x_squared = P256FieldElement::ZERO;
+        let mut x_squared_plus_a = P256FieldElement::ZERO;
+        let mut x_cubed_plus_ax = P256FieldElement::ZERO;
+
+        let result = (|| {
+            self.field_mul_hardware(entropy, x, x, &mut x_squared)?;
+            field_add_mod_p(&x_squared, &coefficient_a, &mut x_squared_plus_a)?;
+            self.field_mul_hardware(entropy, &x_squared_plus_a, x, &mut x_cubed_plus_ax)?;
+            field_add_mod_p(&x_cubed_plus_ax, &coefficient_b, output)
+        })();
+        if result.is_err() {
+            *output = P256FieldElement::ZERO;
+        }
+        result
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn point_is_on_curve_hardware<R: EntropySource>(
+        &self,
+        entropy: &R,
+        point: &P256AffinePoint,
+    ) -> Result<bool, CryptoError> {
+        let x =
+            P256FieldElement::try_from_be_bytes(point.x).map_err(|_| CryptoError::InvalidPoint)?;
+        let y =
+            P256FieldElement::try_from_be_bytes(point.y).map_err(|_| CryptoError::InvalidPoint)?;
+        let mut expected = P256FieldElement::ZERO;
+        let mut actual = P256FieldElement::ZERO;
+        self.compute_y_squared_hardware(entropy, &x, &mut expected)?;
+        self.field_mul_hardware(entropy, &y, &y, &mut actual)?;
+        Ok(expected == actual)
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn point_invert_hardware<R: EntropySource>(
+        &self,
+        entropy: &R,
+        point: &P256AffinePoint,
+        output: &mut P256AffinePoint,
+    ) -> Result<(), CryptoError> {
+        if !self.point_is_on_curve_hardware(entropy, point)? {
+            return Err(CryptoError::InvalidPoint);
+        }
+        let y =
+            P256FieldElement::try_from_be_bytes(point.y).map_err(|_| CryptoError::InvalidPoint)?;
+        let mut negated_y = P256FieldElement::ZERO;
+        field_negate_mod_p(&y, &mut negated_y)?;
+        *output = P256AffinePoint::new(point.x, *negated_y.as_be_bytes());
+        Ok(())
+    }
+
+    #[cfg(target_arch = "riscv32")]
     fn configure_mask(&self, mask: u32) {
         let regs = self.regs();
         regs.pke_mask_rng_cfg()
@@ -900,6 +961,88 @@ pub struct Ws63P256Session<'a, 'd, R> {
     entropy: &'a R,
 }
 
+#[cfg(any(test, target_arch = "riscv32"))]
+fn field_add_mod_p(
+    a: &P256FieldElement,
+    b: &P256FieldElement,
+    output: &mut P256FieldElement,
+) -> Result<(), CryptoError> {
+    let mut wide = [0u8; P256_ELEMENT_BYTES + 1];
+    let mut carry = 0u16;
+    for index in (0..P256_ELEMENT_BYTES).rev() {
+        let sum = u16::from(a.as_be_bytes()[index]) + u16::from(b.as_be_bytes()[index]) + carry;
+        wide[index + 1] = sum as u8;
+        carry = sum >> 8;
+    }
+    wide[0] = carry as u8;
+
+    let mut reduced = wide;
+    let mut borrow = 0u16;
+    for index in (0..=P256_ELEMENT_BYTES).rev() {
+        let modulus = if index == 0 {
+            0
+        } else {
+            u16::from(P256_FIELD_PRIME[index - 1])
+        };
+        let lhs = u16::from(reduced[index]);
+        let rhs = modulus + borrow;
+        if lhs >= rhs {
+            reduced[index] = (lhs - rhs) as u8;
+            borrow = 0;
+        } else {
+            reduced[index] = (lhs + 0x100 - rhs) as u8;
+            borrow = 1;
+        }
+    }
+
+    let selected = if borrow == 0 {
+        &reduced[1..]
+    } else {
+        &wide[1..]
+    };
+    let mut encoded = [0u8; P256_ELEMENT_BYTES];
+    encoded.copy_from_slice(selected);
+    let result = P256FieldElement::try_from_be_bytes(encoded);
+    wide.zeroize();
+    reduced.zeroize();
+    encoded.zeroize();
+    *output = result?;
+    Ok(())
+}
+
+#[cfg(any(test, target_arch = "riscv32"))]
+fn field_negate_mod_p(
+    value: &P256FieldElement,
+    output: &mut P256FieldElement,
+) -> Result<(), CryptoError> {
+    if value == &P256FieldElement::ZERO {
+        *output = P256FieldElement::ZERO;
+        return Ok(());
+    }
+
+    let mut encoded = [0u8; P256_ELEMENT_BYTES];
+    let mut borrow = 0u16;
+    for index in (0..P256_ELEMENT_BYTES).rev() {
+        let lhs = u16::from(P256_FIELD_PRIME[index]);
+        let rhs = u16::from(value.as_be_bytes()[index]) + borrow;
+        if lhs >= rhs {
+            encoded[index] = (lhs - rhs) as u8;
+            borrow = 0;
+        } else {
+            encoded[index] = (lhs + 0x100 - rhs) as u8;
+            borrow = 1;
+        }
+    }
+    if borrow != 0 {
+        encoded.zeroize();
+        return Err(CryptoError::InvalidValue);
+    }
+    let result = P256FieldElement::try_from_be_bytes(encoded);
+    encoded.zeroize();
+    *output = result?;
+    Ok(())
+}
+
 impl<R: EntropySource> TryP256PointMul for Ws63P256Session<'_, '_, R> {
     fn point_mul(
         &self,
@@ -973,6 +1116,58 @@ impl<R: EntropySource> TryP256FieldPow for Ws63P256Session<'_, '_, R> {
         #[cfg(not(target_arch = "riscv32"))]
         {
             let _ = (self.engine, self.entropy, base, exponent, output);
+            Err(CryptoError::Unsupported)
+        }
+    }
+}
+
+impl<R: EntropySource> TryP256ComputeYSquared for Ws63P256Session<'_, '_, R> {
+    fn try_compute_y_squared(
+        &self,
+        x: &P256FieldElement,
+        output: &mut P256FieldElement,
+    ) -> Result<(), CryptoError> {
+        #[cfg(target_arch = "riscv32")]
+        {
+            self.engine
+                .compute_y_squared_hardware(self.entropy, x, output)
+        }
+        #[cfg(not(target_arch = "riscv32"))]
+        {
+            let _ = (self.engine, self.entropy, x, output);
+            Err(CryptoError::Unsupported)
+        }
+    }
+}
+
+impl<R: EntropySource> TryP256PointValidate for Ws63P256Session<'_, '_, R> {
+    fn try_point_is_on_curve(&self, point: &P256AffinePoint) -> Result<bool, CryptoError> {
+        #[cfg(target_arch = "riscv32")]
+        {
+            self.engine.point_is_on_curve_hardware(self.entropy, point)
+        }
+        #[cfg(not(target_arch = "riscv32"))]
+        {
+            let _ = (self.engine, self.entropy, point);
+            Err(CryptoError::Unsupported)
+        }
+    }
+}
+
+impl<R: EntropySource> TryP256PointInvert for Ws63P256Session<'_, '_, R> {
+    fn try_point_invert(
+        &self,
+        point: &P256AffinePoint,
+        output: &mut P256AffinePoint,
+    ) -> Result<(), CryptoError> {
+        #[cfg(target_arch = "riscv32")]
+        {
+            self.engine
+                .point_invert_hardware(self.entropy, point, output)
+        }
+        #[cfg(not(target_arch = "riscv32"))]
+        {
+            let _ = (self.engine, self.entropy, point, output);
             Err(CryptoError::Unsupported)
         }
     }
@@ -1124,6 +1319,34 @@ mod tests {
         assert_eq!(x, P256_GX);
         assert_eq!(y, P256_GY);
         assert_eq!(P256_P, P256_FIELD_PRIME);
+    }
+
+    #[test]
+    fn fixed_field_addition_and_negation_reduce_mod_p() {
+        let mut p_minus_one = P256_FIELD_PRIME;
+        p_minus_one[P256_ELEMENT_BYTES - 1] -= 1;
+        let p_minus_one = P256FieldElement::try_from_be_bytes(p_minus_one).unwrap();
+        let mut one = [0u8; P256_ELEMENT_BYTES];
+        one[P256_ELEMENT_BYTES - 1] = 1;
+        let one = P256FieldElement::try_from_be_bytes(one).unwrap();
+        let mut two = [0u8; P256_ELEMENT_BYTES];
+        two[P256_ELEMENT_BYTES - 1] = 2;
+        let two = P256FieldElement::try_from_be_bytes(two).unwrap();
+        let mut output = P256FieldElement::ZERO;
+
+        field_add_mod_p(&one, &one, &mut output).unwrap();
+        assert_eq!(output, two);
+        field_add_mod_p(&p_minus_one, &one, &mut output).unwrap();
+        assert_eq!(output, P256FieldElement::ZERO);
+        field_add_mod_p(&p_minus_one, &p_minus_one, &mut output).unwrap();
+        let mut p_minus_two = P256_FIELD_PRIME;
+        p_minus_two[P256_ELEMENT_BYTES - 1] -= 2;
+        assert_eq!(output.as_be_bytes(), &p_minus_two);
+
+        field_negate_mod_p(&P256FieldElement::ZERO, &mut output).unwrap();
+        assert_eq!(output, P256FieldElement::ZERO);
+        field_negate_mod_p(&one, &mut output).unwrap();
+        assert_eq!(output, p_minus_one);
     }
 
     #[test]
