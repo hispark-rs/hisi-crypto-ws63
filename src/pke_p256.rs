@@ -13,7 +13,7 @@ use core::cell::Cell;
 use hisi_crypto::sae::{GROUP_19, Group19, RustCryptoGroup19};
 use hisi_crypto::{
     CryptoError, EntropySource,
-    sae::{P256_ELEMENT_BYTES, P256AffinePoint, TryP256PointMul},
+    sae::{P256_ELEMENT_BYTES, P256AffinePoint, P256PointResult, TryP256PointAdd, TryP256PointMul},
 };
 use hisi_hal::peripherals::Pke;
 #[cfg(any(test, target_arch = "riscv32"))]
@@ -124,9 +124,15 @@ const PKE_SECTION_CX: u32 = 3;
 #[cfg(target_arch = "riscv32")]
 const PKE_SECTION_CY: u32 = 6;
 #[cfg(target_arch = "riscv32")]
+const PKE_SECTION_AZ: u32 = 18;
+#[cfg(target_arch = "riscv32")]
 const PKE_SECTION_PX: u32 = 21;
 #[cfg(target_arch = "riscv32")]
 const PKE_SECTION_PY: u32 = 24;
+#[cfg(target_arch = "riscv32")]
+const PKE_SECTION_GX: u32 = 27;
+#[cfg(target_arch = "riscv32")]
+const PKE_SECTION_GY: u32 = 30;
 #[cfg(target_arch = "riscv32")]
 const PKE_SECTION_N: u32 = 57;
 
@@ -256,6 +262,83 @@ impl<'d> Ws63P256<'d> {
     }
 
     #[cfg(target_arch = "riscv32")]
+    fn point_add_hardware<R: EntropySource>(
+        &self,
+        entropy: &R,
+        a: &P256AffinePoint,
+        b: &P256AffinePoint,
+        output: &mut P256PointResult,
+    ) -> Result<(), CryptoError> {
+        let group = RustCryptoGroup19::for_group(GROUP_19)?;
+        group.point_from_xy(&a.x, &a.y)?;
+        group.point_from_xy(&b.x, &b.y)?;
+
+        // The audited vendor add instruction handles distinct affine inputs;
+        // doubling uses the already verified scalar-multiplication sequence.
+        // Two validated P-256 points with equal x and different y are inverses.
+        if a.x == b.x {
+            if a.y != b.y {
+                *output = P256PointResult::Infinity;
+                return Ok(());
+            }
+            let mut scalar = [0u8; P256_ELEMENT_BYTES];
+            scalar[P256_ELEMENT_BYTES - 1] = 2;
+            let mut doubled =
+                P256AffinePoint::new([0; P256_ELEMENT_BYTES], [0; P256_ELEMENT_BYTES]);
+            let result = self.point_mul_hardware(entropy, a, &scalar, &mut doubled);
+            scalar.zeroize();
+            match result {
+                Ok(()) => {
+                    *output = P256PointResult::Affine(doubled);
+                    return Ok(());
+                }
+                Err(error) => {
+                    doubled.x.zeroize();
+                    doubled.y.zeroize();
+                    return Err(error);
+                }
+            }
+        }
+
+        let _guard = self.enter()?;
+        let mut mask_bytes = [0u8; 4];
+        let mut mask = 0;
+        for _ in 0..8 {
+            entropy.fill_entropy(&mut mask_bytes)?;
+            mask = u32::from_le_bytes(mask_bytes);
+            if mask != 0 {
+                break;
+            }
+        }
+        mask_bytes.zeroize();
+        if mask == 0 {
+            return Err(CryptoError::Backend(ERR_MASK_ENTROPY));
+        }
+
+        let mut locked = false;
+        let mut noise = false;
+        let result = (|| {
+            self.lock()?;
+            locked = true;
+            self.set_noise(true);
+            noise = true;
+            self.configure_mask(mask);
+            self.load_curve()?;
+            self.point_add_sequence(a, b, output)
+        })();
+
+        let cleanup = self.cleanup(locked, noise);
+        mask.zeroize();
+        if result.is_err() {
+            *output = P256PointResult::Infinity;
+        }
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    #[cfg(target_arch = "riscv32")]
     fn configure_mask(&self, mask: u32) {
         let regs = self.regs();
         regs.pke_mask_rng_cfg()
@@ -335,20 +418,8 @@ impl<'d> Ws63P256<'d> {
         scalar: &[u8; 32],
         output: &mut P256AffinePoint,
     ) -> Result<(), CryptoError> {
-        self.set_ram(PKE_SECTION_N, &P256_P);
-        self.batch(197, 1)?;
-        self.set_montgomery_parameter(P256_MONT_PARAM_P[1], P256_MONT_PARAM_P[0])?;
-
-        self.set_ram(PKE_SECTION_PX, &point.x);
-        self.set_ram(PKE_SECTION_PY, &point.y);
-        self.set_ram(PKE_SECTION_M, &P256_P);
-        self.batch(163, 2)?;
-        let mut mont_x = [0u8; 32];
-        let mut mont_y = [0u8; 32];
-        // `instr_ecfp_mont_p_2` transforms P in place. CX/CY are populated
-        // only by the following affine-to-Jacobian instruction.
-        self.get_ram(PKE_SECTION_PX, &mut mont_x);
-        self.get_ram(PKE_SECTION_PY, &mut mont_y);
+        self.select_prime_field()?;
+        let (mut mont_x, mut mont_y) = self.montgomery_affine(point)?;
 
         self.set_ram(PKE_SECTION_PX, &mont_x);
         self.set_ram(PKE_SECTION_PY, &mont_y);
@@ -377,6 +448,82 @@ impl<'d> Ws63P256<'d> {
         let group = RustCryptoGroup19::for_group(GROUP_19)?;
         group.point_from_xy(&output.x, &output.y)?;
         Ok(())
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn point_add_sequence(
+        &self,
+        a: &P256AffinePoint,
+        b: &P256AffinePoint,
+        output: &mut P256PointResult,
+    ) -> Result<(), CryptoError> {
+        self.select_prime_field()?;
+        let (mut a_x, mut a_y) = self.montgomery_affine(a)?;
+        let (mut b_x, mut b_y) = self.montgomery_affine(b)?;
+
+        self.set_ram(PKE_SECTION_PX, &a_x);
+        self.set_ram(PKE_SECTION_PY, &a_y);
+        self.set_ram(PKE_SECTION_GX, &b_x);
+        self.set_ram(PKE_SECTION_GY, &b_y);
+        self.batch(125, 18)?;
+
+        let mut z = [0u8; P256_ELEMENT_BYTES];
+        self.get_ram(PKE_SECTION_AZ, &mut z);
+        if z.iter().all(|byte| *byte == 0) {
+            *output = P256PointResult::Infinity;
+            a_x.zeroize();
+            a_y.zeroize();
+            b_x.zeroize();
+            b_y.zeroize();
+            z.zeroize();
+            return Ok(());
+        }
+        z.zeroize();
+
+        // The add instruction leaves A in Jacobian form. Move it into the C
+        // workspace consumed by the shared Jacobian-to-affine sequence.
+        self.batch(182, 3)?;
+        self.jacobian_to_affine()?;
+        self.batch(165, 6)?;
+
+        let mut affine = P256AffinePoint::new([0; P256_ELEMENT_BYTES], [0; P256_ELEMENT_BYTES]);
+        self.get_ram(PKE_SECTION_CX, &mut affine.x);
+        self.get_ram(PKE_SECTION_CY, &mut affine.y);
+        let group = RustCryptoGroup19::for_group(GROUP_19)?;
+        let validation = group.point_from_xy(&affine.x, &affine.y);
+
+        a_x.zeroize();
+        a_y.zeroize();
+        b_x.zeroize();
+        b_y.zeroize();
+        validation?;
+        *output = P256PointResult::Affine(affine);
+        Ok(())
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn select_prime_field(&self) -> Result<(), CryptoError> {
+        self.set_ram(PKE_SECTION_N, &P256_P);
+        self.batch(197, 1)?;
+        self.set_montgomery_parameter(P256_MONT_PARAM_P[1], P256_MONT_PARAM_P[0])
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn montgomery_affine(
+        &self,
+        point: &P256AffinePoint,
+    ) -> Result<([u8; P256_ELEMENT_BYTES], [u8; P256_ELEMENT_BYTES]), CryptoError> {
+        self.set_ram(PKE_SECTION_PX, &point.x);
+        self.set_ram(PKE_SECTION_PY, &point.y);
+        self.set_ram(PKE_SECTION_M, &P256_P);
+        self.batch(163, 2)?;
+        let mut x = [0u8; P256_ELEMENT_BYTES];
+        let mut y = [0u8; P256_ELEMENT_BYTES];
+        // `instr_ecfp_mont_p_2` transforms P in place. CX/CY are populated
+        // only by a subsequent affine-to-Jacobian instruction.
+        self.get_ram(PKE_SECTION_PX, &mut x);
+        self.get_ram(PKE_SECTION_PY, &mut y);
+        Ok((x, y))
     }
 
     #[cfg(target_arch = "riscv32")]
@@ -550,6 +697,25 @@ impl<R: EntropySource> TryP256PointMul for Ws63P256Session<'_, '_, R> {
         #[cfg(not(target_arch = "riscv32"))]
         {
             let _ = (self.engine, self.entropy, point, scalar, output);
+            Err(CryptoError::Unsupported)
+        }
+    }
+}
+
+impl<R: EntropySource> TryP256PointAdd for Ws63P256Session<'_, '_, R> {
+    fn point_add(
+        &self,
+        a: &P256AffinePoint,
+        b: &P256AffinePoint,
+        output: &mut P256PointResult,
+    ) -> Result<(), CryptoError> {
+        #[cfg(target_arch = "riscv32")]
+        {
+            self.engine.point_add_hardware(self.entropy, a, b, output)
+        }
+        #[cfg(not(target_arch = "riscv32"))]
+        {
+            let _ = (self.engine, self.entropy, a, b, output);
             Err(CryptoError::Unsupported)
         }
     }

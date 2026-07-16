@@ -17,13 +17,16 @@ The current surface contains explicitly owned hardware capabilities:
   such as AES-CMAC and RFC 3394 key unwrap remain in their protocol owner and
   consume the narrow `TryBlockCipher` capability.
 - `Ws63P256` separately consumes the HAL `Pke` token and exposes bounded,
-  fallible NIST P-256 affine point multiplication. It borrows entropy only for
-  an explicit session and never falls back to software after a PKE failure.
+  fallible NIST P-256 affine point multiplication and addition. It borrows
+  entropy only for an explicit session and never falls back to software after
+  a PKE failure. Doubling is mapped to the verified scalar-multiplication
+  sequence; inverse affine inputs return the explicit infinity result.
 - raw entropy uses the same uniquely owned TRNG FIFO.
 
-Remaining Dragonfly field arithmetic and point operations still use an explicit
-software capability in the current mixed profile. Point multiplication alone
-must not be described as complete SAE or Dragonfly hardware acceleration.
+Remaining Dragonfly field arithmetic, point inversion, curve checks, and
+`y^2` computation still use an explicit software capability in the current
+mixed profile. Point multiplication and addition must not be described as
+complete SAE or Dragonfly hardware acceleration.
 Callers must choose software, hardware, or accurately named mixed capabilities
 explicitly; this crate never falls back to software after a hardware failure.
 
