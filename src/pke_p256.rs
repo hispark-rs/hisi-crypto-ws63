@@ -26,6 +26,23 @@ use hisi_rom_sys::ws63::security;
 const ERR_BUSY: u32 = 0xffff_1401;
 #[cfg(target_arch = "riscv32")]
 const ERR_MASK_ENTROPY: u32 = 0xffff_1402;
+#[cfg(target_arch = "riscv32")]
+const ERR_LOCK_TIMEOUT: u32 = 0xffff_1403;
+#[cfg(target_arch = "riscv32")]
+const ERR_INSTR_READY_TIMEOUT: u32 = 0xffff_1404;
+#[cfg(target_arch = "riscv32")]
+const ERR_OPERATION_TIMEOUT: u32 = 0xffff_1405;
+#[cfg(target_arch = "riscv32")]
+const ERR_FINISH_STATUS: u32 = 0xffff_1406;
+
+#[cfg(target_arch = "riscv32")]
+const PKE_POLL_LIMIT: usize = 10_000_000;
+#[cfg(target_arch = "riscv32")]
+const PKE_ACPU_LOCK_CODE: u8 = 0xaa;
+#[cfg(target_arch = "riscv32")]
+const PKE_BATCH_START_CODE: u16 = 0x05aa;
+#[cfg(target_arch = "riscv32")]
+const PKE_FINISH_CODE: u8 = 0x05;
 
 #[cfg(target_arch = "riscv32")]
 const P256_P: [u8; 32] = [
@@ -98,8 +115,6 @@ const P256_MONT_PARAM_N: [u32; 2] = [0xccd1_c8aa, 0xee00_bc4f];
 #[cfg(target_arch = "riscv32")]
 const P256_MONT_PARAM_P: [u32; 2] = [0, 1];
 
-#[cfg(target_arch = "riscv32")]
-const PKE_BATCH_INSTR: u32 = 2;
 #[cfg(target_arch = "riscv32")]
 const PKE_WORK_LEN_256: u32 = 4;
 #[cfg(target_arch = "riscv32")]
@@ -216,22 +231,19 @@ impl<'d> Ws63P256<'d> {
             return Err(CryptoError::Backend(ERR_MASK_ENTROPY));
         }
 
-        let mut initialized = false;
         let mut locked = false;
         let mut noise = false;
         let result = (|| {
-            rom_status0(security::HAL_PKE_INIT)?;
-            initialized = true;
-            rom_status0(security::HAL_PKE_LOCK)?;
+            self.lock()?;
             locked = true;
-            rom_void0(security::HAL_PKE_ENABLE_NOISE);
+            self.set_noise(true);
             noise = true;
             self.configure_mask(mask);
             self.load_curve()?;
             self.point_mul_sequence(point, scalar, output)
         })();
 
-        let cleanup = self.cleanup(initialized, locked, noise);
+        let cleanup = self.cleanup(locked, noise);
         mask.zeroize();
         if result.is_err() {
             output.x.zeroize();
@@ -262,6 +274,38 @@ impl<'d> Ws63P256<'d> {
             .write(|w| unsafe { w.dram_mask().bits(0) });
         regs.pke_mask_rng_cfg()
             .write(|w| w.mask_rng_cfg().clear_bit());
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn lock(&self) -> Result<(), CryptoError> {
+        let regs = self.regs();
+        regs.pke_lock_ctrl()
+            .write(|w| w.pke_lock_type().clear_bit().pke_lock().set_bit());
+        for _ in 0..PKE_POLL_LIMIT {
+            if regs.pke_lock_status().read().pke_lock_stat().bits() == PKE_ACPU_LOCK_CODE {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(CryptoError::Backend(ERR_LOCK_TIMEOUT))
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn unlock(&self) {
+        self.regs()
+            .pke_lock_ctrl()
+            .write(|w| w.pke_lock_type().set_bit().pke_lock().set_bit());
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn set_noise(&self, enabled: bool) {
+        self.regs().pke_noise_en().write(|w| {
+            if enabled {
+                w.noise_en().set_bit()
+            } else {
+                w.noise_en().clear_bit()
+            }
+        });
     }
 
     #[cfg(target_arch = "riscv32")]
@@ -366,21 +410,57 @@ impl<'d> Ws63P256<'d> {
             instr_addr: security::PKE_INSTRUCTION_ROM_START as u32 + word_offset * 4,
             instr_num: instruction_count,
         };
-        let configure: unsafe extern "C" fn(u32, u32, *const RomLib, u32) -> i32 =
-            // SAFETY: the address and four-argument RV32 C ABI signature come
-            // from the vendor security ROM table and firmware disassembly.
-            unsafe { core::mem::transmute(security::HAL_PKE_SET_MODE) };
-        // SAFETY: `block` is C-layout and lives through the synchronous call;
-        // its instruction range was selected from the immutable PKE ROM table.
-        rom_status(unsafe { configure(PKE_BATCH_INSTR, 0, &raw const block, PKE_WORK_LEN_256) })?;
-        let start: unsafe extern "C" fn(u32) -> i32 =
-            // SAFETY: the address and one-argument RV32 C ABI signature come
-            // from the vendor security ROM table for HAL_PKE_START.
-            unsafe { core::mem::transmute(security::HAL_PKE_START) };
-        // SAFETY: PKE mode was configured immediately above and the batch
-        // selector is the documented instruction mode.
-        rom_status(unsafe { start(PKE_BATCH_INSTR) })?;
-        rom_status0(security::HAL_PKE_WAIT_DONE)
+        let regs = self.regs();
+        // SAFETY: work length 4 is the documented 256-bit PKE encoding.
+        regs.pke_work_len()
+            .write(|w| unsafe { w.work_len().bits(PKE_WORK_LEN_256) });
+        let mut ready = false;
+        for _ in 0..PKE_POLL_LIMIT {
+            if regs.pke_instr_rdy().read().batch_instr_rdy().bit_is_set() {
+                ready = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !ready {
+            return Err(CryptoError::Backend(ERR_INSTR_READY_TIMEOUT));
+        }
+        // SAFETY: the immutable instruction-ROM address is 32-bit aligned and
+        // `instr_num * 4` is the exact byte length of the audited batch.
+        regs.pke_instr_addr_low()
+            .write(|w| unsafe { w.instr_addr_low().bits(block.instr_addr) });
+        regs.pke_instr_addr_hig()
+            // SAFETY: WS63 exposes a 32-bit PKE instruction-ROM address space.
+            .write(|w| unsafe { w.instr_addr_hig().bits(0) });
+        regs.pke_instr_len()
+            // SAFETY: the audited instruction count cannot overflow this field.
+            .write(|w| unsafe { w.instr_len().bits(block.instr_num * 4) });
+
+        // Clear the old completion latch before starting the next batch.
+        regs.pke_int_nomask_status()
+            // SAFETY: one is the documented W1C request for the finish latch.
+            .write(|w| unsafe { w.finish_int_nomask().bits(1) });
+        // SAFETY: 0x5AA is the vendor-defined PKE batch-start command.
+        regs.pke_start()
+            .write(|w| unsafe { w.bits(u32::from(PKE_BATCH_START_CODE)) });
+        for _ in 0..PKE_POLL_LIMIT {
+            if regs.pke_busy().read().pke_busy().bit_is_clear() {
+                let status = regs
+                    .pke_int_nomask_status()
+                    .read()
+                    .finish_int_nomask()
+                    .bits();
+                if status != PKE_FINISH_CODE {
+                    return Err(CryptoError::Backend(ERR_FINISH_STATUS));
+                }
+                regs.pke_int_nomask_status()
+                    // SAFETY: writing the observed finish code clears the latch.
+                    .write(|w| unsafe { w.finish_int_nomask().bits(PKE_FINISH_CODE) });
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(CryptoError::Backend(ERR_OPERATION_TIMEOUT))
     }
 
     #[cfg(target_arch = "riscv32")]
@@ -407,33 +487,46 @@ impl<'d> Ws63P256<'d> {
 
     #[cfg(target_arch = "riscv32")]
     fn set_montgomery_parameter(&self, low: u32, high: u32) -> Result<(), CryptoError> {
-        let function: unsafe extern "C" fn(u32, u32) -> i32 =
-            // SAFETY: the address and two-argument RV32 C ABI signature come
-            // from the vendor security ROM table for HAL_PKE_SET_MONT_PARA.
-            unsafe { core::mem::transmute(security::HAL_PKE_SET_MONT_PARA) };
-        // SAFETY: the two words are passed by value using the verified ABI.
-        rom_status(unsafe { function(low, high) })
+        let regs = self.regs();
+        // SAFETY: Montgomery parameters are full-width register values derived
+        // from the pinned P-256 vendor curve constants.
+        regs.pke_mont_para0()
+            .write(|w| unsafe { w.mont_para0().bits(low) });
+        regs.pke_mont_para1()
+            // SAFETY: this is the second full-width word of the same parameter.
+            .write(|w| unsafe { w.mont_para1().bits(high) });
+        Ok(())
     }
 
     #[cfg(target_arch = "riscv32")]
-    fn cleanup(&self, initialized: bool, locked: bool, noise: bool) -> Result<(), CryptoError> {
+    fn cleanup(&self, locked: bool, noise: bool) -> Result<(), CryptoError> {
         let mut cleanup_error = None;
         if locked {
-            if let Err(error) = rom_status0(security::HAL_PKE_CLEAN_RAM) {
+            if let Err(error) = self.clean_ram() {
                 cleanup_error = Some(error);
             }
             self.clear_mask();
         }
         if noise {
-            rom_void0(security::HAL_PKE_DISABLE_NOISE);
+            self.set_noise(false);
         }
         if locked {
-            rom_void0(security::HAL_PKE_UNLOCK);
-        }
-        if initialized && let Err(error) = rom_status0(security::HAL_PKE_DEINIT) {
-            cleanup_error.get_or_insert(error);
+            self.unlock();
         }
         cleanup_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn clean_ram(&self) -> Result<(), CryptoError> {
+        let regs = self.regs();
+        regs.pke_dram_clr().write(|w| w.dram_clr().set_bit());
+        for _ in 0..PKE_POLL_LIMIT {
+            if regs.pke_busy().read().pke_busy().bit_is_clear() {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(CryptoError::Backend(ERR_OPERATION_TIMEOUT))
     }
 }
 
@@ -559,24 +652,6 @@ fn shift_right_one(value: &mut [u8]) {
         *byte = (*byte >> 1) | (carry << 7);
         carry = next;
     }
-}
-
-#[cfg(target_arch = "riscv32")]
-fn rom_status0(address: usize) -> Result<(), CryptoError> {
-    // SAFETY: callers supply a security-ROM table address whose audited entry
-    // has the no-argument, status-returning RV32 C ABI.
-    let function: unsafe extern "C" fn() -> i32 = unsafe { core::mem::transmute(address) };
-    // SAFETY: the function pointer was constructed from the audited ROM entry.
-    rom_status(unsafe { function() })
-}
-
-#[cfg(target_arch = "riscv32")]
-fn rom_void0(address: usize) {
-    // SAFETY: callers supply a security-ROM table address whose audited entry
-    // has the no-argument, void-returning RV32 C ABI.
-    let function: unsafe extern "C" fn() = unsafe { core::mem::transmute(address) };
-    // SAFETY: the function pointer was constructed from the audited ROM entry.
-    unsafe { function() };
 }
 
 #[cfg(target_arch = "riscv32")]
