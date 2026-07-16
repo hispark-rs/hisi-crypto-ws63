@@ -1,74 +1,310 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
+use core::{cell::Cell, num::NonZeroU32};
+
 #[cfg(any(feature = "pbkdf2", feature = "hal-trng"))]
 use hisi_crypto::CryptoError;
 #[cfg(feature = "hal-trng")]
 use hisi_crypto::EntropySource;
 #[cfg(feature = "pbkdf2")]
 use hisi_crypto::Pbkdf2HmacSha1;
+use hisi_hal::{
+    peripherals::{Km, Trng},
+    trng::TrngDriver,
+};
+#[cfg(target_arch = "riscv32")]
+use zeroize::Zeroize;
 
-#[cfg(feature = "hal-trng")]
-use hisi_hal::{peripherals::Trng, trng::TrngDriver};
+#[cfg(target_arch = "riscv32")]
+use ws63_pac::km::RegisterBlock;
 
+const DEFAULT_POLL_LIMIT: u32 = 1_000_000;
+#[cfg(all(feature = "pbkdf2", any(target_arch = "riscv32", test)))]
+const PASSWORD_BLOCK_BYTES: usize = 128;
 #[cfg(feature = "pbkdf2")]
-const HMAC_SHA1: u32 = 0x10f6_90a0;
+const SHA1_BLOCK_BYTES: usize = 64;
+#[cfg(all(feature = "pbkdf2", any(target_arch = "riscv32", test)))]
+const SHA1_OUTPUT_BYTES: usize = 20;
+#[cfg(all(feature = "pbkdf2", any(target_arch = "riscv32", test)))]
+const SHA1_INITIAL_STATE: [u8; SHA1_OUTPUT_BYTES] = [
+    0x67, 0x45, 0x23, 0x01, 0xef, 0xcd, 0xab, 0x89, 0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76,
+    0xc3, 0xd2, 0xe1, 0xf0,
+];
 
-#[cfg(feature = "pbkdf2")]
-#[repr(C)]
-struct Pbkdf2Parameters {
-    hash_type: u32,
-    password: *mut u8,
-    password_len: u32,
-    salt: *mut u8,
-    salt_len: u32,
-    iterations: u16,
-}
-
-/// Exclusive access contract for the WS63 global cipher service.
-///
-/// The type is intentionally neither `Copy` nor constructible through a safe
-/// API. A future HAL-backed constructor will consume dedicated cipher/TRNG
-/// resources once those ownership tokens exist.
-pub struct Ws63Crypto {
-    _private: (),
-}
-
-/// Exclusive WS63 hardware entropy source backed by the HAL TRNG driver.
-///
-/// Construction consumes the unique TRNG peripheral token. This prevents a
-/// second safe owner from racing the FIFO and avoids the implicit global UAPI
-/// contract used by the legacy vendor runtime.
+const ERR_BUSY: u32 = 0xffff_1101;
+#[cfg(all(feature = "pbkdf2", target_arch = "riscv32"))]
+const ERR_LOCK_TIMEOUT: u32 = 0xffff_1102;
+#[cfg(all(feature = "pbkdf2", target_arch = "riscv32"))]
+const ERR_OPERATION_TIMEOUT: u32 = 0xffff_1103;
 #[cfg(feature = "hal-trng")]
-pub struct Ws63Entropy<'d> {
-    driver: TrngDriver<'d>,
+const ERR_TRNG: u32 = 0xffff_1104;
+
+/// Bounded polling contract for the WS63 RKP engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RkpPollLimits {
+    lock: NonZeroU32,
+    operation: NonZeroU32,
 }
 
-#[cfg(feature = "hal-trng")]
-impl<'d> Ws63Entropy<'d> {
-    /// Claim the WS63 TRNG peripheral through the HAL ownership model.
-    pub fn new(trng: Trng<'d>) -> Self {
+impl RkpPollLimits {
+    /// Construct explicit non-zero lock and operation poll limits.
+    pub const fn new(lock: NonZeroU32, operation: NonZeroU32) -> Self {
+        Self { lock, operation }
+    }
+
+    /// Maximum attempts used to acquire the RKP hardware lock.
+    pub const fn lock(self) -> NonZeroU32 {
+        self.lock
+    }
+
+    /// Maximum status reads used to await one PBKDF2 output block.
+    pub const fn operation(self) -> NonZeroU32 {
+        self.operation
+    }
+}
+
+impl Default for RkpPollLimits {
+    fn default() -> Self {
+        let Some(limit) = NonZeroU32::new(DEFAULT_POLL_LIMIT) else {
+            unreachable!()
+        };
+        Self::new(limit, limit)
+    }
+}
+
+/// Exclusive WS63 KM/RKP and TRNG crypto capability.
+///
+/// Safe construction consumes both HAL peripheral tokens. The value is not
+/// `Sync`; callers that publish it to multiple runtime tasks must serialize
+/// operations outside critical sections with a bounded scheduler primitive.
+pub struct Ws63Crypto<'d> {
+    _km: Km<'d>,
+    trng: TrngDriver<'d>,
+    #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
+    limits: RkpPollLimits,
+    busy: Cell<bool>,
+}
+
+impl<'d> Ws63Crypto<'d> {
+    /// Claim the WS63 KM/RKP engine and TRNG with conservative poll limits.
+    pub fn new(km: Km<'d>, trng: Trng<'d>) -> Self {
+        Self::with_poll_limits(km, trng, RkpPollLimits::default())
+    }
+
+    /// Claim the hardware with an explicit bounded polling contract.
+    pub fn with_poll_limits(km: Km<'d>, trng: Trng<'d>, limits: RkpPollLimits) -> Self {
         Self {
-            driver: TrngDriver::new(trng),
+            _km: km,
+            trng: TrngDriver::new(trng),
+            limits,
+            busy: Cell::new(false),
         }
     }
+
+    fn enter(&self) -> Result<BusyGuard<'_>, CryptoError> {
+        if self.busy.replace(true) {
+            Err(CryptoError::Backend(ERR_BUSY))
+        } else {
+            Ok(BusyGuard { busy: &self.busy })
+        }
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn regs(&self) -> &'static RegisterBlock {
+        // SAFETY: `self._km` owns the unique HAL token for this static MMIO block.
+        unsafe { &*Km::ptr() }
+    }
+
+    #[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
+    fn derive_hardware(
+        &self,
+        password: &[u8],
+        salt: &[u8],
+        iterations: u16,
+        output: &mut [u8; 32],
+    ) -> Result<(), CryptoError> {
+        let regs = self.regs();
+        self.lock_rkp(regs)?;
+
+        let mut password_block = [0u8; PASSWORD_BLOCK_BYTES];
+        password_block[..password.len()].copy_from_slice(password);
+        let result = (|| {
+            self.write_password(regs, &password_block)?;
+            let mut derived = [0u8; SHA1_OUTPUT_BYTES];
+            for block_index in 1..=2 {
+                let mut salt_block = prepare_sha1_salt_block(salt, block_index);
+                let block_result =
+                    self.calculate_block(regs, &salt_block, iterations, &mut derived);
+                salt_block.zeroize();
+                block_result?;
+                let offset = (block_index - 1) * SHA1_OUTPUT_BYTES;
+                let count = core::cmp::min(SHA1_OUTPUT_BYTES, output.len() - offset);
+                output[offset..offset + count].copy_from_slice(&derived[..count]);
+                derived.zeroize();
+            }
+            Ok(())
+        })();
+
+        password_block.zeroize();
+        self.clear_sensitive_registers(regs);
+        self.unlock_rkp(regs);
+        result
+    }
+
+    #[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
+    fn lock_rkp(&self, regs: &RegisterBlock) -> Result<(), CryptoError> {
+        for _ in 0..self.limits.lock().get() {
+            // SAFETY: 1 is the SVD-modeled three-bit REE lock-owner value.
+            regs.rkp_lock()
+                .write(|w| unsafe { w.km_lock_status().bits(1) });
+            io_fence();
+            if regs.rkp_lock().read().km_lock_status().bits() == 1 {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(CryptoError::Backend(ERR_LOCK_TIMEOUT))
+    }
+
+    #[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
+    fn unlock_rkp(&self, regs: &RegisterBlock) {
+        // SAFETY: 0 is the SVD-modeled three-bit idle/unlocked value.
+        regs.rkp_lock()
+            .write(|w| unsafe { w.km_lock_status().bits(0) });
+        io_fence();
+    }
+
+    #[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
+    fn write_password(
+        &self,
+        regs: &RegisterBlock,
+        password: &[u8; PASSWORD_BLOCK_BYTES],
+    ) -> Result<(), CryptoError> {
+        let start = self
+            .trng
+            .read_blocking()
+            .map_err(|_| CryptoError::Backend(ERR_TRNG))? as usize
+            % regs.rkp_pbkdf2_key_iter().count();
+        for offset in 0..32 {
+            let index = (start + offset) % 32;
+            let word = word_at(password, index);
+            // SAFETY: `data` is the complete SVD-modeled 32-bit write-only word.
+            regs.rkp_pbkdf2_key(index)
+                .write(|w| unsafe { w.data().bits(word) });
+            io_fence();
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
+    fn calculate_block(
+        &self,
+        regs: &RegisterBlock,
+        salt: &[u8; PASSWORD_BLOCK_BYTES],
+        iterations: u16,
+        output: &mut [u8; SHA1_OUTPUT_BYTES],
+    ) -> Result<(), CryptoError> {
+        let start = self
+            .trng
+            .read_blocking()
+            .map_err(|_| CryptoError::Backend(ERR_TRNG))? as usize
+            % 32;
+        for offset in 0..32 {
+            let index = (start + offset) % 32;
+            // SAFETY: `data` is the complete SVD-modeled 32-bit write-only word.
+            regs.rkp_pbkdf2_data(index)
+                .write(|w| unsafe { w.data().bits(word_at(salt, index)) });
+            io_fence();
+        }
+        for (index, chunk) in SHA1_INITIAL_STATE.chunks_exact(4).enumerate() {
+            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+            // SAFETY: `data` is the complete SVD-modeled 32-bit state word.
+            regs.rkp_pbkdf2_val(index)
+                .write(|w| unsafe { w.data().bits(word) });
+            io_fence();
+        }
+        // SAFETY: every value is within its SVD field width: u16 iterations,
+        // software key source 3, SHA-1 selector 1, and one start bit.
+        regs.rkp_cmd_cfg().write(|w| unsafe {
+            w.rkp_pbkdf_calc_time()
+                .bits(iterations)
+                .pbkdf2_key_sel_cfg()
+                .bits(3)
+                .pbkdf2_alg_sel_cfg()
+                .bits(1)
+                .sw_calc_req()
+                .set_bit()
+        });
+        io_fence();
+
+        let mut completed = false;
+        for _ in 0..self.limits.operation().get() {
+            if regs.rkp_cmd_cfg().read().sw_calc_req().bit_is_clear() {
+                completed = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !completed {
+            return Err(CryptoError::Backend(ERR_OPERATION_TIMEOUT));
+        }
+        regs.rkp_raw_int()
+            .write(|w| w.rkp_raw_int().clear_bit_by_one());
+        io_fence();
+        let error = regs.kdf_error().read().error().bits();
+        if error != 0 {
+            return Err(CryptoError::Backend(error));
+        }
+
+        let start = self
+            .trng
+            .read_blocking()
+            .map_err(|_| CryptoError::Backend(ERR_TRNG))? as usize
+            % (SHA1_OUTPUT_BYTES / 4);
+        for offset in 0..(SHA1_OUTPUT_BYTES / 4) {
+            let index = (start + offset) % (SHA1_OUTPUT_BYTES / 4);
+            let bytes = regs
+                .rkp_pbkdf2_val(index)
+                .read()
+                .data()
+                .bits()
+                .to_le_bytes();
+            output[index * 4..index * 4 + 4].copy_from_slice(&bytes);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
+    fn clear_sensitive_registers(&self, regs: &RegisterBlock) {
+        for register in regs.rkp_pbkdf2_data_iter() {
+            // SAFETY: zero fills the complete SVD-modeled 32-bit salt word.
+            register.write(|w| unsafe { w.data().bits(0) });
+        }
+        for register in regs.rkp_pbkdf2_key_iter() {
+            // SAFETY: zero fills the complete SVD-modeled 32-bit password word.
+            register.write(|w| unsafe { w.data().bits(0) });
+        }
+        for register in regs.rkp_pbkdf2_val_iter() {
+            // SAFETY: zero fills the complete SVD-modeled 32-bit result word.
+            register.write(|w| unsafe { w.data().bits(0) });
+        }
+        io_fence();
+    }
 }
 
-impl Ws63Crypto {
-    /// Constructs the backend after the caller proves global exclusivity.
-    ///
-    /// # Safety
-    ///
-    /// Exactly one `Ws63Crypto` may exist in a firmware. The vendor cipher and
-    /// TRNG services must be initialized, and no other runtime may use them
-    /// concurrently outside the service's own serialization contract.
-    pub const unsafe fn assume_exclusive() -> Self {
-        Self { _private: () }
+struct BusyGuard<'a> {
+    busy: &'a Cell<bool>,
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.busy.set(false);
     }
 }
 
 #[cfg(feature = "pbkdf2")]
-impl Pbkdf2HmacSha1 for Ws63Crypto {
+impl Pbkdf2HmacSha1 for Ws63Crypto<'_> {
     fn derive_32(
         &self,
         password: &[u8],
@@ -76,84 +312,87 @@ impl Pbkdf2HmacSha1 for Ws63Crypto {
         iterations: u32,
         output: &mut [u8; 32],
     ) -> Result<(), CryptoError> {
-        if iterations == 0 {
+        if password.len() > SHA1_BLOCK_BYTES
+            || salt.len() > SHA1_BLOCK_BYTES - 13
+            || iterations == 0
+            || iterations > u32::from(u16::MAX)
+        {
             return Err(CryptoError::InvalidLength);
         }
-        let password_len = u32::try_from(password.len()).map_err(|_| CryptoError::InvalidLength)?;
-        let salt_len = u32::try_from(salt.len()).map_err(|_| CryptoError::InvalidLength)?;
-        let parameters = Pbkdf2Parameters {
-            hash_type: HMAC_SHA1,
-            password: password.as_ptr().cast_mut(),
-            password_len,
-            salt: salt.as_ptr().cast_mut(),
-            salt_len,
-            iterations: u16::try_from(iterations).map_err(|_| CryptoError::InvalidLength)?,
-        };
-
+        let _busy = self.enter()?;
         #[cfg(target_arch = "riscv32")]
         {
-            // SAFETY: slices keep every pointer valid for the synchronous UAPI
-            // call; lengths match those allocations and `output` is 32 bytes.
-            let result = unsafe {
-                uapi_drv_cipher_pbkdf2(&parameters, output.as_mut_ptr(), output.len() as u32)
-            };
-            if result == 0 {
-                Ok(())
-            } else {
-                Err(CryptoError::Backend(result))
-            }
+            self.derive_hardware(password, salt, iterations as u16, output)
         }
         #[cfg(not(target_arch = "riscv32"))]
         {
-            let _ = (parameters, output);
+            let _ = (password, salt, iterations, output);
             Err(CryptoError::Unsupported)
         }
     }
 }
 
 #[cfg(feature = "hal-trng")]
-impl EntropySource for Ws63Entropy<'_> {
+impl EntropySource for Ws63Crypto<'_> {
     fn fill_entropy(&self, output: &mut [u8]) -> Result<(), CryptoError> {
-        self.driver
+        let _busy = self.enter()?;
+        self.trng
             .fill_bytes(output)
-            .map_err(|_| CryptoError::Backend(0xffff_1001))
+            .map_err(|_| CryptoError::Backend(ERR_TRNG))
     }
 }
 
-#[cfg(target_arch = "riscv32")]
-unsafe extern "C" {
-    #[cfg(feature = "pbkdf2")]
-    fn uapi_drv_cipher_pbkdf2(
-        parameters: *const Pbkdf2Parameters,
-        output: *mut u8,
-        output_len: u32,
-    ) -> u32;
+#[cfg(all(feature = "pbkdf2", any(target_arch = "riscv32", test)))]
+fn prepare_sha1_salt_block(salt: &[u8], block_index: usize) -> [u8; PASSWORD_BLOCK_BYTES] {
+    let mut padded = [0u8; PASSWORD_BLOCK_BYTES];
+    padded[..salt.len()].copy_from_slice(salt);
+    let index = u32::try_from(block_index).unwrap().to_be_bytes();
+    padded[salt.len()..salt.len() + 4].copy_from_slice(&index);
+    padded[salt.len() + 4] = 0x80;
+    let bit_length = ((SHA1_BLOCK_BYTES + salt.len() + 4) * 8) as u64;
+    padded[SHA1_BLOCK_BYTES - 8..SHA1_BLOCK_BYTES].copy_from_slice(&bit_length.to_be_bytes());
+    padded
 }
 
-#[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
-const _: () = assert!(core::mem::size_of::<Pbkdf2Parameters>() == 24);
+#[cfg(all(feature = "pbkdf2", any(target_arch = "riscv32", test)))]
+fn word_at(bytes: &[u8; PASSWORD_BLOCK_BYTES], index: usize) -> u32 {
+    u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+}
+
+#[cfg(target_arch = "riscv32")]
+#[inline]
+fn io_fence() {
+    // SAFETY: this emits only an ordering barrier for prior/following MMIO.
+    unsafe { core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags)) };
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "pbkdf2")]
-    fn backend() -> Ws63Crypto {
-        // SAFETY: each host test owns its local non-functional backend value.
-        unsafe { Ws63Crypto::assume_exclusive() }
+    #[test]
+    fn poll_limits_are_explicitly_nonzero() {
+        let limits = RkpPollLimits::default();
+        assert_eq!(limits.lock().get(), DEFAULT_POLL_LIMIT);
+        assert_eq!(limits.operation().get(), DEFAULT_POLL_LIMIT);
     }
 
     #[cfg(feature = "pbkdf2")]
     #[test]
-    fn rejects_zero_and_oversized_iterations_before_uapi() {
-        let mut output = [0; 32];
-        assert_eq!(
-            backend().derive_32(b"password", b"salt", 0, &mut output),
-            Err(CryptoError::InvalidLength)
-        );
-        assert_eq!(
-            backend().derive_32(b"password", b"salt", 65536, &mut output),
-            Err(CryptoError::InvalidLength)
-        );
+    fn sha1_salt_padding_matches_vendor_oracle() {
+        let block = prepare_sha1_salt_block(b"IEEE", 1);
+        assert_eq!(&block[..8], b"IEEE\0\0\0\x01");
+        assert_eq!(block[8], 0x80);
+        assert!(block[9..56].iter().all(|byte| *byte == 0));
+        assert_eq!(&block[56..64], &((64 + 4 + 4) * 8u64).to_be_bytes());
+        assert!(block[64..].iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(feature = "pbkdf2")]
+    #[test]
+    fn word_encoding_matches_vendor_little_endian_mmio_copy() {
+        let mut bytes = [0u8; PASSWORD_BLOCK_BYTES];
+        bytes[..4].copy_from_slice(&SHA1_INITIAL_STATE[..4]);
+        assert_eq!(word_at(&bytes, 0), 0x0123_4567);
     }
 }
