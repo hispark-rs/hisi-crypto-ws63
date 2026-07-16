@@ -1,8 +1,8 @@
-//! WS63 PKE-backed NIST P-256 scalar multiplication.
+//! WS63 PKE-backed NIST P-256 arithmetic.
 //!
 //! The register/microcode sequence is derived from the Apache-2.0
 //! `security_unified` PKE driver in the WS63 vendor SDK. This implementation
-//! keeps only the group-19 scalar-multiplication capability required by SAE;
+//! keeps only the fixed group-19 capabilities required by SAE;
 //! it does not import the vendor scheduler, allocator, global curve registry,
 //! or broad PKE provider API.
 
@@ -10,10 +10,15 @@
 use core::cell::Cell;
 
 #[cfg(any(test, target_arch = "riscv32"))]
+use hisi_crypto::sae::P256_FIELD_PRIME;
+#[cfg(any(test, target_arch = "riscv32"))]
 use hisi_crypto::sae::{GROUP_19, Group19, RustCryptoGroup19};
 use hisi_crypto::{
     CryptoError, EntropySource,
-    sae::{P256_ELEMENT_BYTES, P256AffinePoint, P256PointResult, TryP256PointAdd, TryP256PointMul},
+    sae::{
+        P256_ELEMENT_BYTES, P256AffinePoint, P256FieldElement, P256PointResult, TryP256FieldMul,
+        TryP256PointAdd, TryP256PointMul,
+    },
 };
 use hisi_hal::peripherals::Pke;
 #[cfg(any(test, target_arch = "riscv32"))]
@@ -44,11 +49,8 @@ const PKE_BATCH_START_CODE: u16 = 0x05aa;
 #[cfg(target_arch = "riscv32")]
 const PKE_FINISH_CODE: u8 = 0x05;
 
-#[cfg(target_arch = "riscv32")]
-const P256_P: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-];
+#[cfg(any(test, target_arch = "riscv32"))]
+const P256_P: [u8; 32] = P256_FIELD_PRIME;
 #[cfg(target_arch = "riscv32")]
 const P256_A: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -135,6 +137,23 @@ const PKE_SECTION_GX: u32 = 27;
 const PKE_SECTION_GY: u32 = 30;
 #[cfg(target_arch = "riscv32")]
 const PKE_SECTION_N: u32 = 57;
+
+#[cfg(target_arch = "riscv32")]
+const PKE_RSA_SECTION_N: u32 = 0;
+#[cfg(target_arch = "riscv32")]
+const PKE_RSA_SECTION_RR: u32 = 32;
+#[cfg(target_arch = "riscv32")]
+const PKE_RSA_SECTION_CONST_1: u32 = 48;
+#[cfg(target_arch = "riscv32")]
+const PKE_RSA_SECTION_RESULT: u32 = 64;
+#[cfg(target_arch = "riscv32")]
+const PKE_RSA_SECTION_T0: u32 = 96;
+#[cfg(target_arch = "riscv32")]
+const PKE_RSA_SECTION_T1: u32 = 112;
+#[cfg(target_arch = "riscv32")]
+const PKE_RSA_MOD_MUL_WORD_OFFSET: u32 = 326;
+#[cfg(target_arch = "riscv32")]
+const PKE_RSA_MOD_MUL_INSTRUCTION_COUNT: u32 = 6;
 
 #[cfg(target_arch = "riscv32")]
 #[repr(C)]
@@ -339,6 +358,51 @@ impl<'d> Ws63P256<'d> {
     }
 
     #[cfg(target_arch = "riscv32")]
+    fn field_mul_hardware<R: EntropySource>(
+        &self,
+        entropy: &R,
+        a: &P256FieldElement,
+        b: &P256FieldElement,
+        output: &mut P256FieldElement,
+    ) -> Result<(), CryptoError> {
+        let _guard = self.enter()?;
+        let mut mask_bytes = [0u8; 4];
+        let mut mask = 0;
+        for _ in 0..8 {
+            entropy.fill_entropy(&mut mask_bytes)?;
+            mask = u32::from_le_bytes(mask_bytes);
+            if mask != 0 {
+                break;
+            }
+        }
+        mask_bytes.zeroize();
+        if mask == 0 {
+            return Err(CryptoError::Backend(ERR_MASK_ENTROPY));
+        }
+
+        let mut locked = false;
+        let mut noise = false;
+        let result = (|| {
+            self.lock()?;
+            locked = true;
+            self.set_noise(true);
+            noise = true;
+            self.configure_mask(mask);
+            self.field_mul_sequence(a, b, output)
+        })();
+
+        let cleanup = self.cleanup(locked, noise);
+        mask.zeroize();
+        if result.is_err() {
+            *output = P256FieldElement::ZERO;
+        }
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    #[cfg(target_arch = "riscv32")]
     fn configure_mask(&self, mask: u32) {
         let regs = self.regs();
         regs.pke_mask_rng_cfg()
@@ -499,6 +563,42 @@ impl<'d> Ws63P256<'d> {
         validation?;
         *output = P256PointResult::Affine(affine);
         Ok(())
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn field_mul_sequence(
+        &self,
+        a: &P256FieldElement,
+        b: &P256FieldElement,
+        output: &mut P256FieldElement,
+    ) -> Result<(), CryptoError> {
+        self.set_montgomery_parameter(P256_MONT_PARAM_P[1], P256_MONT_PARAM_P[0])?;
+        self.set_ram(PKE_RSA_SECTION_N, &P256_P);
+        // `update_rsa_modulus()` in the vendor driver computes and writes this
+        // section before invoking `instr_rsa_mod_mul`. The first two ROM
+        // instructions consume R^2 to transform both operands to Montgomery
+        // form, so a fixed-prime adapter must reproduce that indirect side
+        // effect explicitly.
+        self.set_ram(PKE_RSA_SECTION_RR, &P256_RRP);
+        self.set_ram(PKE_RSA_SECTION_T0, a.as_be_bytes());
+        self.set_ram(PKE_RSA_SECTION_T1, b.as_be_bytes());
+        self.set_ram(PKE_RSA_SECTION_CONST_1, &CONST_ONE);
+        self.batch(
+            PKE_RSA_MOD_MUL_WORD_OFFSET,
+            PKE_RSA_MOD_MUL_INSTRUCTION_COUNT,
+        )?;
+
+        let mut encoded = [0u8; P256_ELEMENT_BYTES];
+        self.get_ram(PKE_RSA_SECTION_RESULT, &mut encoded);
+        let result = P256FieldElement::try_from_be_bytes(encoded);
+        encoded.zeroize();
+        match result {
+            Ok(result) => {
+                *output = result;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(target_arch = "riscv32")]
@@ -721,6 +821,25 @@ impl<R: EntropySource> TryP256PointAdd for Ws63P256Session<'_, '_, R> {
     }
 }
 
+impl<R: EntropySource> TryP256FieldMul for Ws63P256Session<'_, '_, R> {
+    fn field_mul(
+        &self,
+        a: &P256FieldElement,
+        b: &P256FieldElement,
+        output: &mut P256FieldElement,
+    ) -> Result<(), CryptoError> {
+        #[cfg(target_arch = "riscv32")]
+        {
+            self.engine.field_mul_hardware(self.entropy, a, b, output)
+        }
+        #[cfg(not(target_arch = "riscv32"))]
+        {
+            let _ = (self.engine, self.entropy, a, b, output);
+            Err(CryptoError::Unsupported)
+        }
+    }
+}
+
 #[cfg(target_arch = "riscv32")]
 struct PkeBusyGuard<'a> {
     busy: &'a Cell<bool>,
@@ -856,6 +975,7 @@ mod tests {
         let (x, y) = group.point_to_xy(&generator).unwrap();
         assert_eq!(x, P256_GX);
         assert_eq!(y, P256_GY);
+        assert_eq!(P256_P, P256_FIELD_PRIME);
     }
 
     #[cfg(target_pointer_width = "32")]
