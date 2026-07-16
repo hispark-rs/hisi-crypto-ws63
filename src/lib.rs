@@ -27,6 +27,10 @@ mod spacc_hash;
 use spacc_hash::HashDmaStorage;
 #[cfg(feature = "hash")]
 pub use spacc_hash::{MAX_HASH_INPUT_BYTES, SpaccPollLimits};
+#[cfg(feature = "p256")]
+mod pke_p256;
+#[cfg(feature = "p256")]
+pub use pke_p256::{Ws63P256, Ws63P256Session};
 #[cfg(feature = "cipher")]
 mod spacc_cipher;
 #[cfg(all(feature = "cipher", target_arch = "riscv32"))]

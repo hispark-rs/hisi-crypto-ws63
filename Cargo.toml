@@ -14,13 +14,15 @@ categories = ["cryptography", "embedded", "no-std"]
 critical-section = "1"
 hisi-crypto = "0.1.0-alpha.3"
 hisi-hal = { version = "0.7.0-alpha.2", default-features = false, features = ["chip-ws63", "unstable"] }
+hisi-rom-sys = { version = "0.1.0-alpha.3", features = ["chip-ws63"], optional = true }
 ws63-pac = { version = "0.3.0", default-features = false }
 zeroize = { version = "1", default-features = false }
 
 [features]
-default = ["cipher", "hash", "pbkdf2", "hal-trng"]
+default = ["cipher", "hash", "p256", "pbkdf2", "hal-trng"]
 cipher = []
 hash = []
+p256 = ["dep:hisi-rom-sys"]
 pbkdf2 = []
 hal-trng = []
 diagnostics = ["cipher", "hash"]
