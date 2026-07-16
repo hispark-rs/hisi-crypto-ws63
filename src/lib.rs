@@ -3,6 +3,9 @@
 
 use core::{cell::Cell, num::NonZeroU32};
 
+#[cfg(all(feature = "hash", target_arch = "riscv32"))]
+use core::cell::UnsafeCell;
+
 #[cfg(any(feature = "pbkdf2", feature = "hal-trng"))]
 use hisi_crypto::CryptoError;
 #[cfg(feature = "hal-trng")]
@@ -10,7 +13,7 @@ use hisi_crypto::EntropySource;
 #[cfg(feature = "pbkdf2")]
 use hisi_crypto::Pbkdf2HmacSha1;
 use hisi_hal::{
-    peripherals::{Km, Trng},
+    peripherals::{Km, Spacc, Trng},
     trng::TrngDriver,
 };
 #[cfg(target_arch = "riscv32")]
@@ -18,6 +21,13 @@ use zeroize::Zeroize;
 
 #[cfg(target_arch = "riscv32")]
 use ws63_pac::km::RegisterBlock;
+
+#[cfg(feature = "hash")]
+mod spacc_hash;
+#[cfg(all(feature = "hash", target_arch = "riscv32"))]
+use spacc_hash::HashDmaStorage;
+#[cfg(feature = "hash")]
+pub use spacc_hash::{MAX_HASH_INPUT_BYTES, SpaccPollLimits};
 
 const DEFAULT_POLL_LIMIT: u32 = 1_000_000;
 #[cfg(all(feature = "pbkdf2", any(target_arch = "riscv32", test)))]
@@ -75,29 +85,53 @@ impl Default for RkpPollLimits {
 
 /// Exclusive WS63 KM/RKP and TRNG crypto capability.
 ///
-/// Safe construction consumes both HAL peripheral tokens. The value is not
+/// Safe construction consumes the KM, SPACC, and TRNG HAL peripheral tokens. The value is not
 /// `Sync`; callers that publish it to multiple runtime tasks must serialize
 /// operations outside critical sections with a bounded scheduler primitive.
 pub struct Ws63Crypto<'d> {
     _km: Km<'d>,
+    _spacc: Spacc<'d>,
     trng: TrngDriver<'d>,
     #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
     limits: RkpPollLimits,
+    #[cfg(feature = "hash")]
+    #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
+    spacc_limits: SpaccPollLimits,
+    #[cfg(all(feature = "hash", target_arch = "riscv32"))]
+    hash_storage: UnsafeCell<HashDmaStorage>,
     busy: Cell<bool>,
 }
 
 impl<'d> Ws63Crypto<'d> {
     /// Claim the WS63 KM/RKP engine and TRNG with conservative poll limits.
-    pub fn new(km: Km<'d>, trng: Trng<'d>) -> Self {
-        Self::with_poll_limits(km, trng, RkpPollLimits::default())
+    pub fn new(km: Km<'d>, spacc: Spacc<'d>, trng: Trng<'d>) -> Self {
+        Self::with_poll_limits(
+            km,
+            spacc,
+            trng,
+            RkpPollLimits::default(),
+            #[cfg(feature = "hash")]
+            SpaccPollLimits::default(),
+        )
     }
 
     /// Claim the hardware with an explicit bounded polling contract.
-    pub fn with_poll_limits(km: Km<'d>, trng: Trng<'d>, limits: RkpPollLimits) -> Self {
+    pub fn with_poll_limits(
+        km: Km<'d>,
+        spacc: Spacc<'d>,
+        trng: Trng<'d>,
+        limits: RkpPollLimits,
+        #[cfg(feature = "hash")] spacc_limits: SpaccPollLimits,
+    ) -> Self {
         Self {
             _km: km,
+            _spacc: spacc,
             trng: TrngDriver::new(trng),
             limits,
+            #[cfg(feature = "hash")]
+            spacc_limits,
+            #[cfg(all(feature = "hash", target_arch = "riscv32"))]
+            hash_storage: UnsafeCell::new(HashDmaStorage::new()),
             busy: Cell::new(false),
         }
     }

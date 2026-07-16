@@ -1,0 +1,14 @@
+hisi-crypto-ws63
+
+The WS63 security-accelerator register behavior and operation sequencing used
+by this crate were derived from and checked against the HiSilicon WS63
+`security_unified` driver sources distributed under the Apache License,
+Version 2.0 in the fbb_ws63 source tree.
+
+Copyright (c) HiSilicon (Shanghai) Technologies Co., Ltd. 2023-2023.
+
+The Rust implementation has been substantially modified and independently
+structured for `no_std` Rust. Changes include typed peripheral ownership,
+fallible capability traits, bounded polling, PAC-generated register access,
+explicit cache maintenance, secret clearing, and removal of the original OS,
+allocator, and service-layer dependencies.

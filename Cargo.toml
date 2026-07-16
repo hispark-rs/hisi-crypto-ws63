@@ -2,24 +2,27 @@
 name = "hisi-crypto-ws63"
 version = "0.1.0-alpha.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["sanchuanhehe"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "Fallible WS63 cipher/TRNG backend for hisi-crypto"
 repository = "https://github.com/hispark-rs/hisi-crypto-ws63"
 keywords = ["embedded", "no-std", "cryptography", "hisilicon", "ws63"]
 categories = ["cryptography", "embedded", "no-std"]
 
 [dependencies]
+critical-section = "1"
 hisi-crypto = "0.1.0-alpha.3"
 hisi-hal = { version = "0.7.0-alpha.2", default-features = false, features = ["chip-ws63"] }
 ws63-pac = { version = "0.3.0", default-features = false }
 zeroize = { version = "1", default-features = false }
 
 [features]
-default = ["pbkdf2", "hal-trng"]
+default = ["hash", "pbkdf2", "hal-trng"]
+hash = []
 pbkdf2 = []
 hal-trng = []
+diagnostics = ["hash"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
