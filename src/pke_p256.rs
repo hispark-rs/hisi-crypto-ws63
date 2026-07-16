@@ -17,7 +17,7 @@ use hisi_crypto::{
     CryptoError, EntropySource,
     sae::{
         P256_ELEMENT_BYTES, P256AffinePoint, P256FieldElement, P256PointResult, TryP256FieldMul,
-        TryP256PointAdd, TryP256PointMul,
+        TryP256FieldPow, TryP256PointAdd, TryP256PointMul,
     },
 };
 use hisi_hal::peripherals::Pke;
@@ -141,6 +141,8 @@ const PKE_SECTION_N: u32 = 57;
 #[cfg(target_arch = "riscv32")]
 const PKE_RSA_SECTION_N: u32 = 0;
 #[cfg(target_arch = "riscv32")]
+const PKE_RSA_SECTION_A: u32 = 16;
+#[cfg(target_arch = "riscv32")]
 const PKE_RSA_SECTION_RR: u32 = 32;
 #[cfg(target_arch = "riscv32")]
 const PKE_RSA_SECTION_CONST_1: u32 = 48;
@@ -154,6 +156,30 @@ const PKE_RSA_SECTION_T1: u32 = 112;
 const PKE_RSA_MOD_MUL_WORD_OFFSET: u32 = 326;
 #[cfg(target_arch = "riscv32")]
 const PKE_RSA_MOD_MUL_INSTRUCTION_COUNT: u32 = 6;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_PRE_WORD_OFFSET: u32 = 268;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_PRE_INSTRUCTION_COUNT: u32 = 6;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_00_WORD_OFFSET: u32 = 274;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_00_INSTRUCTION_COUNT: u32 = 2;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_01_WORD_OFFSET: u32 = 274;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_01_INSTRUCTION_COUNT: u32 = 3;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_10_WORD_OFFSET: u32 = 277;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_10_INSTRUCTION_COUNT: u32 = 3;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_11_WORD_OFFSET: u32 = 280;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_11_INSTRUCTION_COUNT: u32 = 3;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_POST_WORD_OFFSET: u32 = 283;
+#[cfg(any(test, target_arch = "riscv32"))]
+const PKE_RSA_EXP_POST_INSTRUCTION_COUNT: u32 = 3;
 
 #[cfg(target_arch = "riscv32")]
 #[repr(C)]
@@ -403,6 +429,51 @@ impl<'d> Ws63P256<'d> {
     }
 
     #[cfg(target_arch = "riscv32")]
+    fn field_pow_hardware<R: EntropySource>(
+        &self,
+        entropy: &R,
+        base: &P256FieldElement,
+        exponent: &[u8; P256_ELEMENT_BYTES],
+        output: &mut P256FieldElement,
+    ) -> Result<(), CryptoError> {
+        let _guard = self.enter()?;
+        let mut mask_bytes = [0u8; 4];
+        let mut mask = 0;
+        for _ in 0..8 {
+            entropy.fill_entropy(&mut mask_bytes)?;
+            mask = u32::from_le_bytes(mask_bytes);
+            if mask != 0 {
+                break;
+            }
+        }
+        mask_bytes.zeroize();
+        if mask == 0 {
+            return Err(CryptoError::Backend(ERR_MASK_ENTROPY));
+        }
+
+        let mut locked = false;
+        let mut noise = false;
+        let result = (|| {
+            self.lock()?;
+            locked = true;
+            self.set_noise(true);
+            noise = true;
+            self.configure_mask(mask);
+            self.field_pow_sequence(base, exponent, output)
+        })();
+
+        let cleanup = self.cleanup(locked, noise);
+        mask.zeroize();
+        if result.is_err() {
+            *output = P256FieldElement::ZERO;
+        }
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    #[cfg(target_arch = "riscv32")]
     fn configure_mask(&self, mask: u32) {
         let regs = self.regs();
         regs.pke_mask_rng_cfg()
@@ -586,6 +657,53 @@ impl<'d> Ws63P256<'d> {
         self.batch(
             PKE_RSA_MOD_MUL_WORD_OFFSET,
             PKE_RSA_MOD_MUL_INSTRUCTION_COUNT,
+        )?;
+
+        let mut encoded = [0u8; P256_ELEMENT_BYTES];
+        self.get_ram(PKE_RSA_SECTION_RESULT, &mut encoded);
+        let result = P256FieldElement::try_from_be_bytes(encoded);
+        encoded.zeroize();
+        match result {
+            Ok(result) => {
+                *output = result;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn field_pow_sequence(
+        &self,
+        base: &P256FieldElement,
+        exponent: &[u8; P256_ELEMENT_BYTES],
+        output: &mut P256FieldElement,
+    ) -> Result<(), CryptoError> {
+        self.set_montgomery_parameter(P256_MONT_PARAM_P[1], P256_MONT_PARAM_P[0])?;
+        self.set_ram(PKE_RSA_SECTION_N, &P256_P);
+        self.set_ram(PKE_RSA_SECTION_A, base.as_be_bytes());
+        self.set_ram(PKE_RSA_SECTION_RR, &P256_RRP);
+        self.set_ram(PKE_RSA_SECTION_CONST_1, &CONST_ONE);
+        self.batch(
+            PKE_RSA_EXP_PRE_WORD_OFFSET,
+            PKE_RSA_EXP_PRE_INSTRUCTION_COUNT,
+        )?;
+
+        let mut started = false;
+        for byte in exponent {
+            for shift in [6, 4, 2, 0] {
+                let pair = (byte >> shift) & 0x3;
+                if !started && pair == 0 {
+                    continue;
+                }
+                started = true;
+                let (word_offset, instruction_count) = rsa_exp_batch(pair);
+                self.batch(word_offset, instruction_count)?;
+            }
+        }
+        self.batch(
+            PKE_RSA_EXP_POST_WORD_OFFSET,
+            PKE_RSA_EXP_POST_INSTRUCTION_COUNT,
         )?;
 
         let mut encoded = [0u8; P256_ELEMENT_BYTES];
@@ -840,6 +958,26 @@ impl<R: EntropySource> TryP256FieldMul for Ws63P256Session<'_, '_, R> {
     }
 }
 
+impl<R: EntropySource> TryP256FieldPow for Ws63P256Session<'_, '_, R> {
+    fn field_pow(
+        &self,
+        base: &P256FieldElement,
+        exponent: &[u8; P256_ELEMENT_BYTES],
+        output: &mut P256FieldElement,
+    ) -> Result<(), CryptoError> {
+        #[cfg(target_arch = "riscv32")]
+        {
+            self.engine
+                .field_pow_hardware(self.entropy, base, exponent, output)
+        }
+        #[cfg(not(target_arch = "riscv32"))]
+        {
+            let _ = (self.engine, self.entropy, base, exponent, output);
+            Err(CryptoError::Unsupported)
+        }
+    }
+}
+
 #[cfg(target_arch = "riscv32")]
 struct PkeBusyGuard<'a> {
     busy: &'a Cell<bool>,
@@ -939,6 +1077,16 @@ fn shift_right_one(value: &mut [u8]) {
     }
 }
 
+#[cfg(any(test, target_arch = "riscv32"))]
+fn rsa_exp_batch(pair: u8) -> (u32, u32) {
+    match pair {
+        0 => (PKE_RSA_EXP_00_WORD_OFFSET, PKE_RSA_EXP_00_INSTRUCTION_COUNT),
+        1 => (PKE_RSA_EXP_01_WORD_OFFSET, PKE_RSA_EXP_01_INSTRUCTION_COUNT),
+        2 => (PKE_RSA_EXP_10_WORD_OFFSET, PKE_RSA_EXP_10_INSTRUCTION_COUNT),
+        _ => (PKE_RSA_EXP_11_WORD_OFFSET, PKE_RSA_EXP_11_INSTRUCTION_COUNT),
+    }
+}
+
 #[cfg(target_arch = "riscv32")]
 fn rom_status(status: i32) -> Result<(), CryptoError> {
     if status == 0 {
@@ -976,6 +1124,28 @@ mod tests {
         assert_eq!(x, P256_GX);
         assert_eq!(y, P256_GY);
         assert_eq!(P256_P, P256_FIELD_PRIME);
+    }
+
+    #[test]
+    fn rsa_exponent_batches_match_vendor_rom_contract() {
+        assert_eq!(
+            (
+                PKE_RSA_EXP_PRE_WORD_OFFSET,
+                PKE_RSA_EXP_PRE_INSTRUCTION_COUNT
+            ),
+            (268, 6)
+        );
+        assert_eq!(rsa_exp_batch(0), (274, 2));
+        assert_eq!(rsa_exp_batch(1), (274, 3));
+        assert_eq!(rsa_exp_batch(2), (277, 3));
+        assert_eq!(rsa_exp_batch(3), (280, 3));
+        assert_eq!(
+            (
+                PKE_RSA_EXP_POST_WORD_OFFSET,
+                PKE_RSA_EXP_POST_INSTRUCTION_COUNT,
+            ),
+            (283, 3)
+        );
     }
 
     #[cfg(target_pointer_width = "32")]
