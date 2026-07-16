@@ -12,11 +12,12 @@ categories = ["cryptography", "embedded", "no-std"]
 
 [dependencies]
 hisi-crypto = "0.1.0-alpha.3"
+hisi-hal = { version = "0.7.0-alpha.2", default-features = false, features = ["chip-ws63"], optional = true }
 
 [features]
-default = ["pbkdf2", "trng"]
+default = ["pbkdf2", "hal-trng"]
 pbkdf2 = []
-trng = []
+hal-trng = ["dep:hisi-hal"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

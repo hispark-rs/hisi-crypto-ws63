@@ -1,12 +1,15 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
-#[cfg(any(feature = "pbkdf2", feature = "trng"))]
+#[cfg(any(feature = "pbkdf2", feature = "hal-trng"))]
 use hisi_crypto::CryptoError;
-#[cfg(feature = "trng")]
+#[cfg(feature = "hal-trng")]
 use hisi_crypto::EntropySource;
 #[cfg(feature = "pbkdf2")]
 use hisi_crypto::Pbkdf2HmacSha1;
+
+#[cfg(feature = "hal-trng")]
+use hisi_hal::{peripherals::Trng, trng::TrngDriver};
 
 #[cfg(feature = "pbkdf2")]
 const HMAC_SHA1: u32 = 0x10f6_90a0;
@@ -29,6 +32,26 @@ struct Pbkdf2Parameters {
 /// resources once those ownership tokens exist.
 pub struct Ws63Crypto {
     _private: (),
+}
+
+/// Exclusive WS63 hardware entropy source backed by the HAL TRNG driver.
+///
+/// Construction consumes the unique TRNG peripheral token. This prevents a
+/// second safe owner from racing the FIFO and avoids the implicit global UAPI
+/// contract used by the legacy vendor runtime.
+#[cfg(feature = "hal-trng")]
+pub struct Ws63Entropy<'d> {
+    driver: TrngDriver<'d>,
+}
+
+#[cfg(feature = "hal-trng")]
+impl<'d> Ws63Entropy<'d> {
+    /// Claim the WS63 TRNG peripheral through the HAL ownership model.
+    pub fn new(trng: Trng<'d>) -> Self {
+        Self {
+            driver: TrngDriver::new(trng),
+        }
+    }
 }
 
 impl Ws63Crypto {
@@ -88,30 +111,12 @@ impl Pbkdf2HmacSha1 for Ws63Crypto {
     }
 }
 
-#[cfg(feature = "trng")]
-impl EntropySource for Ws63Crypto {
+#[cfg(feature = "hal-trng")]
+impl EntropySource for Ws63Entropy<'_> {
     fn fill_entropy(&self, output: &mut [u8]) -> Result<(), CryptoError> {
-        if output.is_empty() {
-            return Ok(());
-        }
-        let length = u32::try_from(output.len()).map_err(|_| CryptoError::InvalidLength)?;
-        #[cfg(target_arch = "riscv32")]
-        {
-            // SAFETY: `output` is writable for exactly `length` bytes and the
-            // vendor call is synchronous.
-            let result =
-                unsafe { uapi_drv_cipher_trng_get_random_bytes(output.as_mut_ptr(), length) };
-            if result == 0 {
-                Ok(())
-            } else {
-                Err(CryptoError::Backend(result))
-            }
-        }
-        #[cfg(not(target_arch = "riscv32"))]
-        {
-            let _ = (length, output);
-            Err(CryptoError::Unsupported)
-        }
+        self.driver
+            .fill_bytes(output)
+            .map_err(|_| CryptoError::Backend(0xffff_1001))
     }
 }
 
@@ -123,8 +128,6 @@ unsafe extern "C" {
         output: *mut u8,
         output_len: u32,
     ) -> u32;
-    #[cfg(feature = "trng")]
-    fn uapi_drv_cipher_trng_get_random_bytes(output: *mut u8, length: u32) -> u32;
 }
 
 #[cfg(all(target_arch = "riscv32", feature = "pbkdf2"))]
@@ -134,7 +137,7 @@ const _: () = assert!(core::mem::size_of::<Pbkdf2Parameters>() == 24);
 mod tests {
     use super::*;
 
-    #[cfg(any(feature = "pbkdf2", feature = "trng"))]
+    #[cfg(feature = "pbkdf2")]
     fn backend() -> Ws63Crypto {
         // SAFETY: each host test owns its local non-functional backend value.
         unsafe { Ws63Crypto::assume_exclusive() }
@@ -152,11 +155,5 @@ mod tests {
             backend().derive_32(b"password", b"salt", 65536, &mut output),
             Err(CryptoError::InvalidLength)
         );
-    }
-
-    #[cfg(feature = "trng")]
-    #[test]
-    fn empty_entropy_request_is_a_noop() {
-        assert_eq!(backend().fill_entropy(&mut []), Ok(()));
     }
 }
