@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-07-17
+
 ### Added
 
 - PAC-driven SPACC SHA-1/SHA-256 and HMAC-SHA1/HMAC-SHA256 with bounded polling,
@@ -9,6 +11,10 @@
 - PAC-driven SPACC AES-128/192/256 block encryption/decryption using a locked
   KM/KLAD MCipher keyslot, bounded waits, cache maintenance, and fail-closed
   cleanup. NIST vectors and repeated WPA2 silicon HIL cover the path.
+- PKE-backed fixed P-256 point multiplication, point addition, field
+  multiplication, exponentiation, and composed group operations for SAE.
+- Explicitly injected static SPACC descriptor storage so firmware RAM cost and
+  ownership remain visible at construction.
 
 ### Changed
 
