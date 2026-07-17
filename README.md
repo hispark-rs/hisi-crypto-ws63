@@ -5,7 +5,9 @@ capability traits.
 
 The current surface contains explicitly owned hardware capabilities:
 
-- `Ws63Crypto::new` consumes the HAL `Km`, `Spacc`, and `Trng` peripheral tokens.
+- `Ws63Crypto::new` consumes `Ws63CryptoResources`, which binds the HAL `Km`,
+  `Spacc`, and `Trng` peripheral tokens to caller-owned static
+  `Ws63CryptoStorage`.
 - PBKDF2-HMAC-SHA1 drives the PAC-modeled RKP engine directly with bounded lock
   and completion polling, key/salt/output-window clearing, and no dependency on
   a vendor security archive or global UAPI symbol.
@@ -39,7 +41,7 @@ be serialized with a bounded scheduler primitive outside IRQ, critical-section,
 and scheduler-lock contexts. `RkpPollLimits`, `SpaccPollLimits`, and
 `SpaccCipherPollLimits` make hardware waits explicit; timeouts are returned to
 the caller and never trigger a software fallback. PKE ownership is kept in the
-separate `Ws63P256` capability so `Ws63Crypto::new` does not grow into an
+separate `Ws63P256` capability so `Ws63CryptoResources` does not grow into an
 all-hardware constructor.
 
 ## Source provenance

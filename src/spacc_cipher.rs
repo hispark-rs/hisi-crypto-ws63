@@ -565,9 +565,8 @@ impl Ws63Crypto<'_> {
     ) -> Result<(), CryptoError> {
         self.clear_sym_channel(regs)?;
         // SAFETY: `Ws63Crypto::enter` serializes every public operation and the
-        // value is !Sync. This temporary internal storage will be replaced by
-        // caller-provided static storage before the capability is stabilized.
-        let storage = unsafe { &mut *self.cipher_storage.get() };
+        // caller moved the unique static storage reference into this backend.
+        let storage = unsafe { &mut *self.storage.cipher.get() };
         storage.clear();
 
         let input_nodes = u32::try_from(storage.input_nodes.as_ptr() as usize)
@@ -749,7 +748,7 @@ impl Ws63Crypto<'_> {
     fn scrub_cipher_storage(&self) {
         // SAFETY: the caller invokes this only after channel clear completed;
         // the public busy guard still exclusively owns the backend storage.
-        let storage = unsafe { &mut *self.cipher_storage.get() };
+        let storage = unsafe { &mut *self.storage.cipher.get() };
         storage.clear();
         // SAFETY: remove plaintext/ciphertext copies from RAM as well as cache;
         // the backend still owns every aligned range and SPACC has stopped.

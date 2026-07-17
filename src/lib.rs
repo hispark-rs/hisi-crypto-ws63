@@ -3,7 +3,7 @@
 
 use core::{cell::Cell, num::NonZeroU32};
 
-#[cfg(all(any(feature = "cipher", feature = "hash"), target_arch = "riscv32"))]
+#[cfg(any(feature = "cipher", feature = "hash"))]
 use core::cell::UnsafeCell;
 
 use hisi_crypto::CryptoError;
@@ -23,7 +23,7 @@ use ws63_pac::km::RegisterBlock;
 
 #[cfg(feature = "hash")]
 mod spacc_hash;
-#[cfg(all(feature = "hash", target_arch = "riscv32"))]
+#[cfg(feature = "hash")]
 use spacc_hash::HashDmaStorage;
 #[cfg(feature = "hash")]
 pub use spacc_hash::{MAX_HASH_INPUT_BYTES, SpaccPollLimits};
@@ -33,7 +33,7 @@ mod pke_p256;
 pub use pke_p256::{Ws63P256, Ws63P256Session};
 #[cfg(feature = "cipher")]
 mod spacc_cipher;
-#[cfg(all(feature = "cipher", target_arch = "riscv32"))]
+#[cfg(feature = "cipher")]
 use spacc_cipher::CipherDmaStorage;
 #[cfg(feature = "cipher")]
 pub use spacc_cipher::SpaccCipherPollLimits;
@@ -64,6 +64,82 @@ const ERR_TRNG: u32 = 0xffff_1104;
 pub struct RkpPollLimits {
     lock: NonZeroU32,
     operation: NonZeroU32,
+}
+
+/// Caller-owned static DMA storage for the WS63 SPACC capabilities.
+///
+/// SPACC consumes physical SRAM addresses after the initiating Rust call has
+/// entered the hardware. Keeping this storage outside [`Ws63Crypto`] makes its
+/// RAM cost visible to the firmware and prevents a backend value from silently
+/// growing its `.bss` footprint as capabilities are added. Initialize it in a
+/// `StaticCell` (or equivalent one-time static owner) and move the resulting
+/// mutable reference into [`Ws63CryptoResources`].
+#[repr(align(32))]
+pub struct Ws63CryptoStorage {
+    #[cfg(feature = "hash")]
+    #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
+    hash: UnsafeCell<HashDmaStorage>,
+    #[cfg(feature = "cipher")]
+    #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
+    cipher: UnsafeCell<CipherDmaStorage>,
+}
+
+impl Ws63CryptoStorage {
+    /// Create zeroed storage suitable for one WS63 crypto backend.
+    pub const fn new() -> Self {
+        Self {
+            #[cfg(feature = "hash")]
+            hash: UnsafeCell::new(HashDmaStorage::new()),
+            #[cfg(feature = "cipher")]
+            cipher: UnsafeCell::new(CipherDmaStorage::new()),
+        }
+    }
+
+    /// Static SRAM reserved by the selected hash/cipher feature set.
+    pub const fn size_bytes() -> usize {
+        core::mem::size_of::<Self>()
+    }
+
+    /// Required alignment of the caller-provided storage.
+    pub const fn align_bytes() -> usize {
+        core::mem::align_of::<Self>()
+    }
+}
+
+impl Default for Ws63CryptoStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Explicit hardware resources used by [`Ws63Crypto`].
+///
+/// PKE remains a separate [`Ws63P256`] capability. This bundle is intentionally
+/// limited to the engines shared by PBKDF2, SPACC hash/cipher, and entropy so
+/// adding another algorithm does not add another positional constructor
+/// argument.
+pub struct Ws63CryptoResources<'d> {
+    km: Km<'d>,
+    spacc: Spacc<'d>,
+    trng: Trng<'d>,
+    storage: &'static mut Ws63CryptoStorage,
+}
+
+impl<'d> Ws63CryptoResources<'d> {
+    /// Bind the unique HAL tokens to caller-owned static DMA storage.
+    pub fn new(
+        km: Km<'d>,
+        spacc: Spacc<'d>,
+        trng: Trng<'d>,
+        storage: &'static mut Ws63CryptoStorage,
+    ) -> Self {
+        Self {
+            km,
+            spacc,
+            trng,
+            storage,
+        }
+    }
 }
 
 impl RkpPollLimits {
@@ -110,13 +186,17 @@ pub struct Ws63Crypto<'d> {
     #[cfg(feature = "hash")]
     #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
     spacc_limits: SpaccPollLimits,
-    #[cfg(all(feature = "hash", target_arch = "riscv32"))]
-    hash_storage: UnsafeCell<HashDmaStorage>,
     #[cfg(feature = "cipher")]
     #[cfg_attr(not(target_arch = "riscv32"), allow(dead_code))]
     cipher_limits: SpaccCipherPollLimits,
-    #[cfg(all(feature = "cipher", target_arch = "riscv32"))]
-    cipher_storage: UnsafeCell<CipherDmaStorage>,
+    #[cfg_attr(
+        any(
+            not(target_arch = "riscv32"),
+            all(not(feature = "hash"), not(feature = "cipher"))
+        ),
+        allow(dead_code)
+    )]
+    storage: &'static Ws63CryptoStorage,
     #[cfg_attr(
         not(any(
             feature = "cipher",
@@ -130,12 +210,10 @@ pub struct Ws63Crypto<'d> {
 }
 
 impl<'d> Ws63Crypto<'d> {
-    /// Claim the WS63 KM/RKP engine and TRNG with conservative poll limits.
-    pub fn new(km: Km<'d>, spacc: Spacc<'d>, trng: Trng<'d>) -> Self {
+    /// Claim the explicit WS63 resources with conservative poll limits.
+    pub fn new(resources: Ws63CryptoResources<'d>) -> Self {
         Self::with_poll_limits(
-            km,
-            spacc,
-            trng,
+            resources,
             RkpPollLimits::default(),
             #[cfg(feature = "hash")]
             SpaccPollLimits::default(),
@@ -146,13 +224,17 @@ impl<'d> Ws63Crypto<'d> {
 
     /// Claim the hardware with an explicit bounded polling contract.
     pub fn with_poll_limits(
-        km: Km<'d>,
-        spacc: Spacc<'d>,
-        trng: Trng<'d>,
+        resources: Ws63CryptoResources<'d>,
         limits: RkpPollLimits,
         #[cfg(feature = "hash")] spacc_limits: SpaccPollLimits,
         #[cfg(feature = "cipher")] cipher_limits: SpaccCipherPollLimits,
     ) -> Self {
+        let Ws63CryptoResources {
+            km,
+            spacc,
+            trng,
+            storage,
+        } = resources;
         Self {
             _km: km,
             _spacc: spacc,
@@ -160,12 +242,9 @@ impl<'d> Ws63Crypto<'d> {
             limits,
             #[cfg(feature = "hash")]
             spacc_limits,
-            #[cfg(all(feature = "hash", target_arch = "riscv32"))]
-            hash_storage: UnsafeCell::new(HashDmaStorage::new()),
             #[cfg(feature = "cipher")]
             cipher_limits,
-            #[cfg(all(feature = "cipher", target_arch = "riscv32"))]
-            cipher_storage: UnsafeCell::new(CipherDmaStorage::new()),
+            storage,
             busy: Cell::new(false),
         }
     }
@@ -482,5 +561,12 @@ mod tests {
         let mut bytes = [0u8; PASSWORD_BLOCK_BYTES];
         bytes[..4].copy_from_slice(&SHA1_INITIAL_STATE[..4]);
         assert_eq!(word_at(&bytes, 0), 0x0123_4567);
+    }
+
+    #[cfg(all(feature = "hash", feature = "cipher"))]
+    #[test]
+    fn caller_owned_storage_has_audited_dma_layout() {
+        assert_eq!(Ws63CryptoStorage::align_bytes(), 32);
+        assert_eq!(Ws63CryptoStorage::size_bytes(), 4_384);
     }
 }

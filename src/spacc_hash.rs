@@ -242,7 +242,7 @@ impl Ws63Crypto<'_> {
             // SAFETY: every public hash/MAC entry holds `Ws63Crypto::enter` for
             // this operation. `Ws63Crypto` is !Sync and the runtime adds a
             // scheduler mutex before sharing it, so this storage is exclusive.
-            let storage = unsafe { &mut *self.hash_storage.get() };
+            let storage = unsafe { &mut *self.storage.hash.get() };
             let padded_len = prepare_padded_message(&mut storage.bytes, prefix, parts)?;
             let node_address = u32::try_from(storage.nodes.as_ptr() as usize)
                 .map_err(|_| CryptoError::Backend(ERR_SPACC_ADDRESS))?;
@@ -286,7 +286,7 @@ impl Ws63Crypto<'_> {
         })();
 
         // SAFETY: the storage remains exclusively borrowed by the busy guard.
-        let storage = unsafe { &mut *self.hash_storage.get() };
+        let storage = unsafe { &mut *self.storage.hash.get() };
         storage.clear();
         // SAFETY: clear the SRAM copy so a later bus master cannot observe the
         // prior key material after the CPU cache line is eventually evicted.
