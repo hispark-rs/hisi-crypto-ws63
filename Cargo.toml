@@ -1,6 +1,6 @@
 [package]
 name = "hisi-crypto-ws63"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2024"
 rust-version = "1.88"
 authors = ["sanchuanhehe"]
@@ -14,7 +14,7 @@ categories = ["cryptography", "embedded", "no-std"]
 critical-section = "1"
 hisi-crypto = "0.1.0-alpha.4"
 hisi-hal = { version = "0.7.0-alpha.3", default-features = false, features = ["chip-ws63", "unstable"] }
-hisi-rom-sys = { version = "0.1.0-alpha.3", features = ["chip-ws63"], optional = true }
+hisi-rom-sys = { version = "=0.1.0-alpha.4", features = ["chip-ws63"], optional = true }
 ws63-pac = { version = "0.4.0", default-features = false }
 zeroize = { version = "1", default-features = false }
 

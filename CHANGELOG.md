@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-07-20
+
+### Fixed
+
+- Updated the ROM facade to `hisi-rom-sys 0.1.0-alpha.4`, making the public
+  WS63 PKE security entry-point metadata available in standalone crates.io
+  builds instead of relying on the parent workspace patch.
+
 ## [0.1.0-alpha.2] - 2026-07-17
 
 ### Added
