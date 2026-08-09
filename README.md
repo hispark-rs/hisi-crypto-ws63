@@ -18,9 +18,10 @@ The current surface contains explicitly owned hardware capabilities:
   both SM3 and HMAC-SM3 pass public known-answer vectors in the parent
   repository's `tests-hil` suite on real WS63 silicon.
 - AES-128/192/256 single-block encryption and decryption drive a SPACC
-  symmetric channel with a KM/KLAD-managed key slot. Higher-level protocols
-  such as AES-CMAC and RFC 3394 key unwrap remain in their protocol owner and
-  consume the narrow `TryBlockCipher` capability.
+  symmetric channel with a KM/KLAD-managed key slot. Algorithm-typed
+  AES-128-CMAC composes that fallible primitive with bounded fragmented input
+  and RFC 4493 subkeys; all four RFC message-length vectors pass in the parent
+  repository's WS63 HIL suite. RFC 3394 key unwrap remains in its protocol owner.
 - `Ws63P256` separately consumes the HAL `Pke` token and exposes bounded,
   fallible NIST P-256 affine point multiplication/addition and fixed-prime
   field multiplication/squaring. Field inputs use canonical typed elements;

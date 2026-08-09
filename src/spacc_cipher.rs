@@ -2,7 +2,7 @@
 
 use core::num::NonZeroU32;
 
-use hisi_crypto::{CryptoError, TryBlockCipher};
+use hisi_crypto::{CryptoError, TryBlockCipher, TryMacAlgorithm, algorithm};
 use zeroize::Zeroize;
 
 use crate::Ws63Crypto;
@@ -11,6 +11,9 @@ use crate::Ws63Crypto;
 use ws63_pac::{km, spacc};
 
 const AES_BLOCK_BYTES: usize = 16;
+const CMAC_RB: u8 = 0x87;
+/// Maximum message size accepted by one bounded AES-CMAC operation.
+pub const MAX_CMAC_INPUT_BYTES: usize = 4096;
 const SYM_CHANNEL_INDEX: usize = 0;
 const SYM_CHANNEL_NUMBER: u32 = 1;
 const SYM_CHANNEL_MASK: u32 = 1 << SYM_CHANNEL_NUMBER;
@@ -175,6 +178,70 @@ impl KeyLength {
 }
 
 impl Ws63Crypto<'_> {
+    fn aes_cmac(
+        &self,
+        key: &[u8],
+        parts: &[&[u8]],
+        output: &mut [u8; AES_BLOCK_BYTES],
+    ) -> Result<(), CryptoError> {
+        output.zeroize();
+        if key.len() != AES_BLOCK_BYTES {
+            return Err(CryptoError::InvalidKey);
+        }
+        let total = checked_parts_len(parts)?;
+        if total > MAX_CMAC_INPUT_BYTES {
+            return Err(CryptoError::InvalidLength);
+        }
+
+        let mut l = [0u8; AES_BLOCK_BYTES];
+        let mut k1 = [0u8; AES_BLOCK_BYTES];
+        let mut k2 = [0u8; AES_BLOCK_BYTES];
+        let mut state = [0u8; AES_BLOCK_BYTES];
+        let mut block = [0u8; AES_BLOCK_BYTES];
+        let mut encrypted = [0u8; AES_BLOCK_BYTES];
+
+        let result = (|| {
+            self.cipher_block(key, &[0; AES_BLOCK_BYTES], &mut l, false)?;
+            double_cmac_subkey(&l, &mut k1);
+            double_cmac_subkey(&k1, &mut k2);
+
+            let block_count = core::cmp::max(1, total.div_ceil(AES_BLOCK_BYTES));
+            let mut cursor = PartsCursor::new(parts);
+            for index in 0..block_count {
+                block.fill(0);
+                let last = index + 1 == block_count;
+                let remaining = total.saturating_sub(index * AES_BLOCK_BYTES);
+                let block_len = core::cmp::min(remaining, AES_BLOCK_BYTES);
+                cursor.copy_exact(&mut block[..block_len])?;
+
+                if last {
+                    if block_len == AES_BLOCK_BYTES && total != 0 {
+                        xor_block(&mut block, &k1);
+                    } else {
+                        block[block_len] = 0x80;
+                        xor_block(&mut block, &k2);
+                    }
+                }
+                xor_block(&mut block, &state);
+                self.cipher_block(key, &block, &mut encrypted, false)?;
+                state.copy_from_slice(&encrypted);
+            }
+            output.copy_from_slice(&state);
+            Ok(())
+        })();
+
+        l.zeroize();
+        k1.zeroize();
+        k2.zeroize();
+        state.zeroize();
+        block.zeroize();
+        encrypted.zeroize();
+        if result.is_err() {
+            output.zeroize();
+        }
+        result
+    }
+
     #[cfg(target_arch = "riscv32")]
     fn cipher_spacc_regs(&self) -> &'static spacc::RegisterBlock {
         // SAFETY: `self._spacc` owns the unique HAL token for this MMIO block.
@@ -858,6 +925,72 @@ impl TryBlockCipher for Ws63Crypto<'_> {
     }
 }
 
+impl TryMacAlgorithm<algorithm::AesCmac, 16> for Ws63Crypto<'_> {
+    fn mac(&self, key: &[u8], parts: &[&[u8]], output: &mut [u8; 16]) -> Result<(), CryptoError> {
+        let _busy = self.enter()?;
+        self.aes_cmac(key, parts, output)
+    }
+}
+
+fn checked_parts_len(parts: &[&[u8]]) -> Result<usize, CryptoError> {
+    parts.iter().try_fold(0usize, |total, part| {
+        total
+            .checked_add(part.len())
+            .ok_or(CryptoError::InvalidLength)
+    })
+}
+
+fn xor_block(block: &mut [u8; AES_BLOCK_BYTES], mask: &[u8; AES_BLOCK_BYTES]) {
+    for (byte, mask) in block.iter_mut().zip(mask) {
+        *byte ^= *mask;
+    }
+}
+
+fn double_cmac_subkey(input: &[u8; AES_BLOCK_BYTES], output: &mut [u8; AES_BLOCK_BYTES]) {
+    let carry = input[0] >> 7;
+    for index in 0..AES_BLOCK_BYTES {
+        let next = input.get(index + 1).copied().unwrap_or(0) >> 7;
+        output[index] = (input[index] << 1) | next;
+    }
+    if carry != 0 {
+        output[AES_BLOCK_BYTES - 1] ^= CMAC_RB;
+    }
+}
+
+struct PartsCursor<'a> {
+    parts: &'a [&'a [u8]],
+    part: usize,
+    offset: usize,
+}
+
+impl<'a> PartsCursor<'a> {
+    const fn new(parts: &'a [&'a [u8]]) -> Self {
+        Self {
+            parts,
+            part: 0,
+            offset: 0,
+        }
+    }
+
+    fn copy_exact(&mut self, mut output: &mut [u8]) -> Result<(), CryptoError> {
+        while !output.is_empty() {
+            let Some(part) = self.parts.get(self.part) else {
+                return Err(CryptoError::InvalidLength);
+            };
+            if self.offset == part.len() {
+                self.part += 1;
+                self.offset = 0;
+                continue;
+            }
+            let count = core::cmp::min(output.len(), part.len() - self.offset);
+            output[..count].copy_from_slice(&part[self.offset..self.offset + count]);
+            self.offset += count;
+            output = &mut output[count..];
+        }
+        Ok(())
+    }
+}
+
 #[cfg(target_arch = "riscv32")]
 #[inline]
 fn io_fence() {
@@ -892,5 +1025,43 @@ mod tests {
         assert_eq!(limits.operation().get(), DEFAULT_POLL_LIMIT);
         assert_eq!(limits.keyslot().get(), DEFAULT_POLL_LIMIT);
         assert_eq!(limits.klad().get(), DEFAULT_POLL_LIMIT);
+    }
+
+    #[test]
+    fn cmac_subkeys_match_rfc_4493() {
+        let l = [
+            0x7d, 0xf7, 0x6b, 0x0c, 0x1a, 0xb8, 0x99, 0xb3, 0x3e, 0x42, 0xf0, 0x47, 0xb9, 0x1b,
+            0x54, 0x6f,
+        ];
+        let mut k1 = [0; 16];
+        let mut k2 = [0; 16];
+        double_cmac_subkey(&l, &mut k1);
+        double_cmac_subkey(&k1, &mut k2);
+        assert_eq!(
+            k1,
+            [
+                0xfb, 0xee, 0xd6, 0x18, 0x35, 0x71, 0x33, 0x66, 0x7c, 0x85, 0xe0, 0x8f, 0x72, 0x36,
+                0xa8, 0xde,
+            ]
+        );
+        assert_eq!(
+            k2,
+            [
+                0xf7, 0xdd, 0xac, 0x30, 0x6a, 0xe2, 0x66, 0xcc, 0xf9, 0x0b, 0xc1, 0x1e, 0xe4, 0x6d,
+                0x51, 0x3b,
+            ]
+        );
+    }
+
+    #[test]
+    fn parts_cursor_crosses_empty_and_fragmented_inputs() {
+        let parts: &[&[u8]] = &[b"", b"012", b"", b"34567", b"89"];
+        let mut cursor = PartsCursor::new(parts);
+        let mut first = [0; 4];
+        let mut second = [0; 6];
+        cursor.copy_exact(&mut first).unwrap();
+        cursor.copy_exact(&mut second).unwrap();
+        assert_eq!(&first, b"0123");
+        assert_eq!(&second, b"456789");
     }
 }

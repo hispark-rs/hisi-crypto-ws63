@@ -36,7 +36,7 @@ mod spacc_cipher;
 #[cfg(feature = "cipher")]
 use spacc_cipher::CipherDmaStorage;
 #[cfg(feature = "cipher")]
-pub use spacc_cipher::SpaccCipherPollLimits;
+pub use spacc_cipher::{MAX_CMAC_INPUT_BYTES, SpaccCipherPollLimits};
 
 const DEFAULT_POLL_LIMIT: u32 = 1_000_000;
 #[cfg(all(feature = "pbkdf2", any(target_arch = "riscv32", test)))]

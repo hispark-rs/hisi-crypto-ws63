@@ -8,6 +8,10 @@
   vendor-audited selector, mode, initial state, bounded polling, and existing
   caller-owned DMA storage. Both paths pass the public known-answer vectors in
   the parent repository's `tests-hil` suite on real WS63 silicon.
+- Add bounded algorithm-typed AES-128-CMAC over the existing SPACC/KM block
+  cipher capability, including fragmented input handling, RFC 4493 subkeys,
+  secret intermediate clearing, and fail-closed hardware error propagation.
+  All four RFC 4493 message-length vectors pass on real WS63 silicon.
 
 ## [0.1.0-alpha.3] - 2026-07-20
 
