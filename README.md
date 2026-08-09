@@ -11,9 +11,12 @@ The current surface contains explicitly owned hardware capabilities:
 - PBKDF2-HMAC-SHA1 drives the PAC-modeled RKP engine directly with bounded lock
   and completion polling, key/salt/output-window clearing, and no dependency on
   a vendor security archive or global UAPI symbol.
-- SHA-1/SHA-256 and HMAC-SHA1/HMAC-SHA256 drive the PAC-modeled SPACC hash
+- SHA-1/SHA-256/SM3 and HMAC-SHA1/HMAC-SHA256/HMAC-SM3 drive the PAC-modeled SPACC hash
   channel with bounded lock/clear/completion polling, aligned DMA descriptors,
-  explicit D-cache maintenance, and secret-buffer clearing.
+  explicit D-cache maintenance, and secret-buffer clearing. SM3 uses the typed
+  algorithm capability so it cannot be confused with SHA-256 by output length;
+  both SM3 and HMAC-SM3 pass public known-answer vectors in the parent
+  repository's `tests-hil` suite on real WS63 silicon.
 - AES-128/192/256 single-block encryption and decryption drive a SPACC
   symmetric channel with a KM/KLAD-managed key slot. Higher-level protocols
   such as AES-CMAC and RFC 3394 key unwrap remain in their protocol owner and

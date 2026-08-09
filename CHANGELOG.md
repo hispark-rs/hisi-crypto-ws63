@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add algorithm-typed PAC-driven SPACC SM3 and HMAC-SM3 paths using the
+  vendor-audited selector, mode, initial state, bounded polling, and existing
+  caller-owned DMA storage. Both paths pass the public known-answer vectors in
+  the parent repository's `tests-hil` suite on real WS63 silicon.
+
 ## [0.1.0-alpha.3] - 2026-07-20
 
 ### Fixed

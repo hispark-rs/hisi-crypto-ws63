@@ -2,7 +2,7 @@
 
 use core::num::NonZeroU32;
 
-use hisi_crypto::{CryptoError, TryHash, TryMac};
+use hisi_crypto::{CryptoError, TryHash, TryHashAlgorithm, TryMac, TryMacAlgorithm, algorithm};
 use zeroize::Zeroize;
 
 use crate::Ws63Crypto;
@@ -39,6 +39,10 @@ const SHA1_INITIAL_STATE: [u8; 20] = [
 const SHA256_INITIAL_STATE: [u8; 32] = [
     0x6a, 0x09, 0xe6, 0x67, 0xbb, 0x67, 0xae, 0x85, 0x3c, 0x6e, 0xf3, 0x72, 0xa5, 0x4f, 0xf5, 0x3a,
     0x51, 0x0e, 0x52, 0x7f, 0x9b, 0x05, 0x68, 0x8c, 0x1f, 0x83, 0xd9, 0xab, 0x5b, 0xe0, 0xcd, 0x19,
+];
+const SM3_INITIAL_STATE: [u8; 32] = [
+    0x73, 0x80, 0x16, 0x6f, 0x49, 0x14, 0xb2, 0xb9, 0x17, 0x24, 0x42, 0xd7, 0xda, 0x8a, 0x06, 0x00,
+    0xa9, 0x6f, 0x30, 0xbc, 0x16, 0x31, 0x38, 0xaa, 0xe3, 0x8d, 0xee, 0x4d, 0xb0, 0xfb, 0x0e, 0x4e,
 ];
 
 /// Bounded polling contract for one WS63 SPACC hash operation.
@@ -88,13 +92,14 @@ impl Default for SpaccPollLimits {
 enum HashAlgorithm {
     Sha1,
     Sha256,
+    Sm3,
 }
 
 impl HashAlgorithm {
     const fn output_len(self) -> usize {
         match self {
             Self::Sha1 => 20,
-            Self::Sha256 => 32,
+            Self::Sha256 | Self::Sm3 => 32,
         }
     }
 
@@ -102,6 +107,7 @@ impl HashAlgorithm {
         match self {
             Self::Sha1 => 0x0a,
             Self::Sha256 => 0x0b,
+            Self::Sm3 => 0x0c,
         }
     }
 
@@ -109,6 +115,7 @@ impl HashAlgorithm {
         match self {
             Self::Sha1 => 0,
             Self::Sha256 => 1,
+            Self::Sm3 => 0,
         }
     }
 
@@ -116,6 +123,7 @@ impl HashAlgorithm {
         match self {
             Self::Sha1 => &SHA1_INITIAL_STATE,
             Self::Sha256 => &SHA256_INITIAL_STATE,
+            Self::Sm3 => &SM3_INITIAL_STATE,
         }
     }
 }
@@ -455,7 +463,7 @@ impl Ws63Crypto<'_> {
         let (state_words, remainder) = algorithm.initial_state().as_chunks::<4>();
         debug_assert!(remainder.is_empty());
         for (index, chunk) in state_words.iter().enumerate() {
-            // SAFETY: SHA-1 uses 5 words and SHA-256 uses 8, both within 5 bits.
+            // SAFETY: SHA-1 uses 5 words; SHA-256 and SM3 use 8, all within 5 bits.
             regs.chann1_hash_state_val_addr(HASH_CHANNEL_INDEX)
                 .write(|w| unsafe { w.index().bits(index as u8) });
             let state = u32::from_le_bytes(*chunk);
@@ -516,7 +524,7 @@ impl Ws63Crypto<'_> {
         let (output_words, remainder) = output.as_chunks_mut::<4>();
         debug_assert!(remainder.is_empty());
         for (index, chunk) in output_words.iter_mut().enumerate() {
-            // SAFETY: SHA-1 uses 5 words and SHA-256 uses 8, both within 5 bits.
+            // SAFETY: SHA-1 uses 5 words; SHA-256 and SM3 use 8, all within 5 bits.
             regs.chann1_hash_state_val_addr(HASH_CHANNEL_INDEX)
                 .write(|w| unsafe { w.index().bits(index as u8) });
             let bytes = regs
@@ -561,6 +569,47 @@ impl TryMac<32> for Ws63Crypto<'_> {
     fn mac(&self, key: &[u8], parts: &[&[u8]], output: &mut [u8; 32]) -> Result<(), CryptoError> {
         let _busy = self.enter()?;
         self.spacc_hmac(HashAlgorithm::Sha256, key, parts, output)
+    }
+}
+
+impl TryHashAlgorithm<algorithm::Sha1, 20> for Ws63Crypto<'_> {
+    fn hash(&self, parts: &[&[u8]], output: &mut [u8; 20]) -> Result<(), CryptoError> {
+        TryHash::<20>::hash(self, parts, output)
+    }
+}
+
+impl TryHashAlgorithm<algorithm::Sha256, 32> for Ws63Crypto<'_> {
+    fn hash(&self, parts: &[&[u8]], output: &mut [u8; 32]) -> Result<(), CryptoError> {
+        TryHash::<32>::hash(self, parts, output)
+    }
+}
+
+impl TryHashAlgorithm<algorithm::Sm3, 32> for Ws63Crypto<'_> {
+    fn hash(&self, parts: &[&[u8]], output: &mut [u8; 32]) -> Result<(), CryptoError> {
+        let _busy = self.enter()?;
+        if checked_parts_len(parts)? > MAX_HASH_INPUT_BYTES {
+            return Err(CryptoError::InvalidLength);
+        }
+        self.spacc_hash(HashAlgorithm::Sm3, None, parts, output)
+    }
+}
+
+impl TryMacAlgorithm<algorithm::Sha1, 20> for Ws63Crypto<'_> {
+    fn mac(&self, key: &[u8], parts: &[&[u8]], output: &mut [u8; 20]) -> Result<(), CryptoError> {
+        TryMac::<20>::mac(self, key, parts, output)
+    }
+}
+
+impl TryMacAlgorithm<algorithm::Sha256, 32> for Ws63Crypto<'_> {
+    fn mac(&self, key: &[u8], parts: &[&[u8]], output: &mut [u8; 32]) -> Result<(), CryptoError> {
+        TryMac::<32>::mac(self, key, parts, output)
+    }
+}
+
+impl TryMacAlgorithm<algorithm::Sm3, 32> for Ws63Crypto<'_> {
+    fn mac(&self, key: &[u8], parts: &[&[u8]], output: &mut [u8; 32]) -> Result<(), CryptoError> {
+        let _busy = self.enter()?;
+        self.spacc_hmac(HashAlgorithm::Sm3, key, parts, output)
     }
 }
 
@@ -688,6 +737,22 @@ mod tests {
         assert_eq!(&buffer[..HASH_BLOCK_BYTES], &prefix);
         assert_eq!(&buffer[HASH_BLOCK_BYTES..HASH_BLOCK_BYTES + 4], b"abc\x80");
         assert_eq!(&buffer[padded - 8..padded], &(67u64 * 8).to_be_bytes());
+    }
+
+    #[test]
+    fn sm3_configuration_matches_vendor_oracle() {
+        let algorithm = HashAlgorithm::Sm3;
+        assert_eq!(algorithm.output_len(), 32);
+        assert_eq!(algorithm.algorithm_select(), 0x0c);
+        assert_eq!(algorithm.algorithm_mode(), 0);
+        assert_eq!(
+            algorithm.initial_state(),
+            &[
+                0x73, 0x80, 0x16, 0x6f, 0x49, 0x14, 0xb2, 0xb9, 0x17, 0x24, 0x42, 0xd7, 0xda, 0x8a,
+                0x06, 0x00, 0xa9, 0x6f, 0x30, 0xbc, 0x16, 0x31, 0x38, 0xaa, 0xe3, 0x8d, 0xee, 0x4d,
+                0xb0, 0xfb, 0x0e, 0x4e,
+            ]
+        );
     }
 
     #[test]
