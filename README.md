@@ -29,7 +29,10 @@ The current surface contains explicitly owned hardware capabilities:
   explicitly rather than exposing generic bignum arithmetic. It borrows entropy
   only for an explicit session and never falls back to software after a PKE
   failure. Doubling is mapped to the verified scalar-multiplication sequence;
-  inverse affine inputs return the explicit infinity result.
+  inverse affine inputs return the explicit infinity result. The same session
+  implements the chip-neutral typed P-256 public-key/ECDH contract through that
+  point-multiply capability. Private-key generation still requires a separately
+  selected `TryCryptoRng`; the raw WS63 TRNG interface is not promoted to a DRBG.
 - raw entropy uses the same uniquely owned TRNG FIFO.
 
 Remaining Dragonfly exponentiation/inversion/Legendre arithmetic, point

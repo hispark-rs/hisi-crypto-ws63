@@ -12,6 +12,9 @@
   cipher capability, including fragmented input handling, RFC 4493 subkeys,
   secret intermediate clearing, and fail-closed hardware error propagation.
   All four RFC 4493 message-length vectors pass on real WS63 silicon.
+- Bind the existing fallible PKE point-multiply session to the chip-neutral
+  typed P-256 public-key and ECDH contract without adding a second driver or
+  treating raw TRNG output as a CSPRNG.
 
 ## [0.1.0-alpha.3] - 2026-07-20
 

@@ -1295,6 +1295,22 @@ fn rom_status(status: i32) -> Result<(), CryptoError> {
 mod tests {
     use super::*;
 
+    struct TestEntropy;
+
+    impl EntropySource for TestEntropy {
+        fn fill_entropy(&self, output: &mut [u8]) -> Result<(), CryptoError> {
+            output.fill(0x5a);
+            Ok(())
+        }
+    }
+
+    fn assert_key_agreement<T: hisi_crypto::p256::TryP256KeyAgreement>() {}
+
+    #[test]
+    fn session_exposes_typed_p256_key_agreement() {
+        assert_key_agreement::<Ws63P256Session<'static, 'static, TestEntropy>>();
+    }
+
     #[test]
     fn naf_round_trips_representative_scalars() {
         for scalar in [1u32, 2, 3, 7, 15, 0x8000_0001, u32::MAX] {
