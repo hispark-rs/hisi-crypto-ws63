@@ -557,16 +557,45 @@ impl<'d> Ws63P256<'d> {
 
     #[cfg(target_arch = "riscv32")]
     fn lock(&self) -> Result<(), CryptoError> {
+        self.try_lock(PKE_POLL_LIMIT)
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn try_lock(&self, attempts: usize) -> Result<(), CryptoError> {
         let regs = self.regs();
         regs.pke_lock_ctrl()
             .write(|w| w.pke_lock_type().clear_bit().pke_lock().set_bit());
-        for _ in 0..PKE_POLL_LIMIT {
+        for _ in 0..attempts {
             if regs.pke_lock_status().read().pke_lock_stat().bits() == PKE_ACPU_LOCK_CODE {
                 return Ok(());
             }
             core::hint::spin_loop();
         }
         Err(CryptoError::Backend(ERR_LOCK_TIMEOUT))
+    }
+
+    /// Diagnostic-only proof that PKE lock timeout is fail closed and reusable.
+    #[cfg(all(target_arch = "riscv32", feature = "diagnostics"))]
+    #[doc(hidden)]
+    pub fn diagnostic_lock_timeout_recovery<R: EntropySource>(
+        &self,
+        entropy: &R,
+    ) -> Result<(), CryptoError> {
+        if self.try_lock(0) != Err(CryptoError::Backend(ERR_LOCK_TIMEOUT)) {
+            return Err(CryptoError::Backend(0xffff_14f1));
+        }
+
+        let generator = P256AffinePoint::new(P256_GX, P256_GY);
+        let mut scalar = [0u8; P256_ELEMENT_BYTES];
+        scalar[P256_ELEMENT_BYTES - 1] = 1;
+        let mut output = P256AffinePoint::new([0; P256_ELEMENT_BYTES], [0; P256_ELEMENT_BYTES]);
+        let result = self.point_mul_hardware(entropy, &generator, &scalar, &mut output);
+        scalar.zeroize();
+        match result {
+            Ok(()) if output == generator => Ok(()),
+            Ok(()) => Err(CryptoError::Backend(0xffff_14f2)),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(target_arch = "riscv32")]

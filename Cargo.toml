@@ -25,7 +25,7 @@ hash = []
 p256 = ["dep:hisi-rom-sys"]
 pbkdf2 = []
 hal-trng = []
-diagnostics = ["cipher", "hash"]
+diagnostics = ["cipher", "hash", "p256"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
