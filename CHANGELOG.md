@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-08-13
+
 ### Added
 
 - Add algorithm-typed PAC-driven SPACC SM3 and HMAC-SM3 paths using the
