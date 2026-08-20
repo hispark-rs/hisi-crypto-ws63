@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-08-20
+
+### Changed
+
+- Update the exact `hisi-hal` dependency to `0.7.0-alpha.9`, keeping the WS63
+  crypto backend on the same peripheral-token release as the radio
+  composition without changing algorithm behavior.
+
 ## [0.1.0-alpha.4] - 2026-08-13
 
 ### Added

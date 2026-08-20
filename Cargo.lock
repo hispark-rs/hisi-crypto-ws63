@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "hisi-crypto-ws63"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "critical-section",
  "hisi-crypto",
@@ -292,9 +292,9 @@ dependencies = [
 
 [[package]]
 name = "hisi-hal"
-version = "0.7.0-alpha.8"
+version = "0.7.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9243eb361398e7c2df2ebdff515b877fcf16b031e74aaf3339d3e88fb4ba6cdc"
+checksum = "cafdcff49f401ba4f72ec904b52082afa7eb000624dc5c7c6487d3becfd9d611"
 dependencies = [
  "cfg-if",
  "critical-section",
