@@ -1,0 +1,3 @@
+# Explicit development graph; HAL alpha.10 is not published.
+[patch.crates-io]
+hisi-hal = { git = "https://github.com/hispark-rs/hisi-hal.git", rev = "5895b95560ca1789d2aea37cfd6db51ba05e416a" }
