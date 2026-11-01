@@ -58,3 +58,8 @@ HiSilicon WS63 `security_unified` driver sources. This Rust implementation is a
 modified, independently structured `no_std` implementation with typed resource
 ownership, bounded failures, PAC access, and Rust crypto capability traits. See
 `NOTICE` for attribution.
+
+Development integration note: this branch pins HAL `0.7.0-alpha.10` so the
+parent does not link a second HAL instance beside the runtime time profile.
+The HAL version is not published; independent checks use the explicit remote
+pins in `.ci/development-dependencies.toml`. This is not release qualification.
